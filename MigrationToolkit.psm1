@@ -13,6 +13,120 @@ $script:MgConfigPath = [Environment]::GetEnvironmentVariable('MG_CONFIG_PATH')
 if (-not $script:MgConfigPath) {
 	$script:MgConfigPath = Join-Path $PSScriptRoot 'Config.json'
 }
+$script:ProductSheetDefaultPath = Join-Path $PSScriptRoot 'downloads/Product names and service plan identifiers for licensing.csv'
+if (Test-Path -LiteralPath $script:ProductSheetDefaultPath) {
+	$script:MicrosoftProductSheetPath = (Resolve-Path -LiteralPath $script:ProductSheetDefaultPath).Path
+}
+$script:MicrosoftProductSheetCache = $null
+
+function Get-MicrosoftProductSheet {
+	[CmdletBinding()]
+	param(
+		[string]$DestinationPath = $script:ProductSheetDefaultPath,
+		[string]$Uri = 'https://download.microsoft.com/download/e/3/e/e3e9faf2-f28b-490a-9ada-c6089a1fc5b0/Product%20names%20and%20service%20plan%20identifiers%20for%20licensing.csv'
+	)
+
+	$destDir = Split-Path -Parent $DestinationPath
+	if (-not (Test-Path -LiteralPath $destDir)) {
+		New-Item -ItemType Directory -Path $destDir -Force | Out-Null
+	}
+	Invoke-WebRequest -Uri $Uri -OutFile $DestinationPath -UseBasicParsing -ErrorAction Stop | Out-Null
+	$resolved = (Resolve-Path -LiteralPath $DestinationPath).Path
+	$script:MicrosoftProductSheetPath = $resolved
+	$script:MicrosoftProductSheetCache = $null
+	return $resolved
+}
+
+function Import-MicrosoftProductSheet {
+	[CmdletBinding()]
+	param(
+		[string]$Path
+	)
+
+	if (-not $Path) {
+		if ($script:MicrosoftProductSheetPath -and (Test-Path -LiteralPath $script:MicrosoftProductSheetPath)) {
+			$Path = $script:MicrosoftProductSheetPath
+		}
+		elseif (Test-Path -LiteralPath $script:ProductSheetDefaultPath) {
+			$Path = $script:ProductSheetDefaultPath
+		}
+		else {
+			throw "Product sheet not found. Run Get-MicrosoftProductSheet first to download the CSV."
+		}
+	}
+	if (-not (Test-Path -LiteralPath $Path)) {
+		throw "Product sheet path '$Path' not found. Run Get-MicrosoftProductSheet to download it."
+	}
+	$resolved = (Resolve-Path -LiteralPath $Path).Path
+	$data = Import-Csv -LiteralPath $resolved | ForEach-Object {
+		$pdn = $_.Product_Display_Name
+		if (-not $pdn -and $_.PSObject.Properties.Name -contains '﻿Product_Display_Name') {
+			$pdn = $_.'﻿Product_Display_Name'
+		}
+		[pscustomobject]@{
+			ProductDisplayName            = $pdn
+			StringId                      = $_.String_Id
+			SkuId                         = $_.GUID
+			ServicePlanName               = $_.Service_Plan_Name
+			ServicePlanId                 = $_.Service_Plan_Id
+			ServicePlansIncludedFriendly  = $_.Service_Plans_Included_Friendly_Names
+		}
+	}
+	$script:MicrosoftProductSheetPath = $resolved
+	$script:MicrosoftProductSheetCache = $data
+	return $data
+}
+
+function Get-MSProduct {
+	[CmdletBinding()]
+	param(
+		[string]$SkuId,
+		[string]$StringId,
+		[string]$Name,
+		[string]$ServicePlanId,
+		[string]$ServicePlanName,
+		[switch]$Reload
+	)
+
+	if ($Reload -or -not $script:MicrosoftProductSheetCache) {
+		Import-MicrosoftProductSheet | Out-Null
+	}
+	$rows = $script:MicrosoftProductSheetCache
+
+	if ($SkuId) {
+		$sku = $SkuId.Trim().ToLower()
+		$rows = $rows | Where-Object { ($_.SkuId ?? '').ToLower() -eq $sku }
+	}
+	if ($StringId) {
+		$needle = $StringId.Trim()
+		$rows = $rows | Where-Object { $_.StringId -like "*$needle*" }
+	}
+	if ($Name) {
+		$needle = $Name.Trim()
+		$rows = $rows | Where-Object {
+			($_.ProductDisplayName -like "*$needle*") -or
+			($_.ServicePlansIncludedFriendly -like "*$needle*")
+		}
+	}
+	if ($ServicePlanId) {
+		$plan = $ServicePlanId.Trim().ToLower()
+		$rows = $rows | Where-Object { ($_.ServicePlanId ?? '').ToLower() -eq $plan }
+	}
+	if ($ServicePlanName) {
+		$needle = $ServicePlanName.Trim()
+		$rows = $rows | Where-Object { $_.ServicePlanName -like "*$needle*" }
+	}
+	return $rows
+}
+
+function Get-MicrosoftOfficeProduct {
+	[CmdletBinding()]
+	param(
+		[Parameter(Mandatory)][string]$SkuId
+	)
+
+	return Get-MSProduct -SkuId $SkuId | Select-Object -First 1
+}
 
 function Set-MgProfileDirectory {
 	[CmdletBinding()]
@@ -691,8 +805,7 @@ function Connect-Source {
 		if ($PSBoundParameters.ContainsKey('Verbose')) {
 			$invokeParams['Verbose'] = $true
 		}
-		#return
-		Connect-MgCachedTenant @invokeParams
+		return Connect-MgCachedTenant @invokeParams
 	}
 
 	if (-not $ConfigPath -and $script:ActiveProjectContext) {
@@ -730,8 +843,7 @@ function Connect-Target {
 		if ($PSBoundParameters.ContainsKey('Verbose')) {
 			$invokeParams['Verbose'] = $true
 		}
-		#return 
-		Connect-MgCachedTenant @invokeParams
+		return Connect-MgCachedTenant @invokeParams
 	}
 
 	if (-not $ConfigPath -and $script:ActiveProjectContext) {
@@ -1163,7 +1275,7 @@ UPDATE Tasks SET total = {0}, updatedOnUtc = '{1}' WHERE taskId = '{2}';
 
             $assignedSkus = @()
             if ($u.AssignedLicenses) {
-                $assignedSkus = @($u.AssignedLicenses | ForEach-Object { (Get-MicrosoftOfficeProduct -SkuId $_.SkuId).Product_Display_Name })
+                $assignedSkus = @($u.AssignedLicenses | ForEach-Object { (Get-MicrosoftOfficeProduct -SkuId $_.SkuId).ProductDisplayName })
             }
             $AssignedLicenses = ($assignedSkus -join ",")
 
@@ -1290,13 +1402,13 @@ UPDATE Tasks SET total = {0}, updatedOnUtc = '{1}' WHERE taskId = '{2}';
             }
             else {
                 $type = 'NonMailEnabledUser'
-            }
+	        }
 
-            $assignedSkus = @()
-            if ($u.AssignedLicenses) {
-                $assignedSkus = @($u.AssignedLicenses | ForEach-Object { (Get-MicrosoftOfficeProduct -SkuId $_.SkuId).Product_Display_Name })
-            }
-            $AssignedLicenses = ($assignedSkus -join ",")
+	        $assignedSkus = @()
+	        if ($u.AssignedLicenses) {
+	            $assignedSkus = @($u.AssignedLicenses | ForEach-Object { (Get-MicrosoftOfficeProduct -SkuId $_.SkuId).ProductDisplayName })
+	        }
+	        $AssignedLicenses = ($assignedSkus -join ",")
 
             if ($UseSqlite -and $dbPath) {
                 $nowLoop = (Get-Date).ToUniversalTime().ToString('o')
@@ -1345,107 +1457,8 @@ VALUES ('{0}', '{1}', '{2}', '{3}');
         }
         throw
     }
-}function Invoke-DiscoverTargetAccounts {
-	[CmdletBinding()]
-	param(
-		[string]$ProjectPath,
-		[string]$OutputPath,
-		[switch]$UseSqlite
-	)
-
-	$projectPath = Resolve-ProjectPath $ProjectPath
-	$context = Get-MigrationProjectContext -ProjectPath $projectPath
-	if (-not $OutputPath) {
-		$OutputPath = Join-Path $context.ProjectPath 'DiscoveredTargetAccounts.csv'
-	}
-	$dbPath = $null
-	$nowIso = (Get-Date).ToUniversalTime().ToString('o')
-	if ($UseSqlite) {
-		$dbPath = Get-MigrationDatabase -ProjectPath $context.ProjectPath
-	}
-
-	Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null
-	Connect-ProjectTargetTenant -ProjectPath $context.ProjectPath -Silent | Out-Null
-	$users = $null
-	try {
-		$users = Get-MgUser -All -Property 'id','displayName','userPrincipalName','mail','proxyAddresses','assignedLicenses'  -ErrorAction Stop |
-		Select-Object 'id','displayName','userPrincipalName','mail','proxyAddresses','assignedLicenses'
-	}
-	finally {
-		Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null
-	}
-
-	$mailboxMap = @{}
-	try {
-		Connect-ProjectTargetExchange -ProjectPath $context.ProjectPath | Out-Null
-		try {
-			$recipients = Get-EXORecipient -ResultSize Unlimited -PropertySets All -ErrorAction Stop
-			foreach ($recip in $recipients) {
-				if ($recip.ExternalDirectoryObjectId) {
-					$mailboxMap[$recip.ExternalDirectoryObjectId] = $recip.RecipientTypeDetails
-				}
-			}
-		}
-		finally {
-			Disconnect-ExchangeOnline -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
-		}
-	}
-	catch {
-		Write-Warning "Exchange discovery (target) failed: $($_.Exception.Message). Mailbox type will be blank."
-	}
-	$rows = foreach ($u in $users) {
-		$type = $null
-		if ($mailboxMap.ContainsKey($u.Id)) {
-			$type = $mailboxMap[$u.Id]
-		}
-		elseif ($u.Mail -or ($u.ProxyAddresses -and $u.ProxyAddresses.Count -gt 0)) {
-			$type = 'MailEnabledUser'
-		}
-		else {
-			$type = 'NonMailEnabledUser'
-		}
-
-		$assignedSkus = @()
-		if ($u.AssignedLicenses) {
-			$assignedSkus = @($u.AssignedLicenses | ForEach-Object { (Get-MicrosoftOfficeProduct -SkuId $_.SkuId).Product_Display_Name })
-		}
-		$AssignedLicenses = ($assignedSkus -join ",")
-
-		if ($UseSqlite -and $dbPath) {
-			$insertAccount = @"
-INSERT OR REPLACE INTO AccountsTarget (objectId, targetUpn, displayName, mail, proxyAddresses, assignedLicenses, mailboxType, usageLocation, lastSeenUtc)
-VALUES ('{0}', '{1}', '{2}', '{3}', '{4}', '{5}', '{6}', '{7}', '{8}');
-"@ -f ($u.Id -replace "'","''"), ($u.UserPrincipalName -replace "'","''"), ($u.DisplayName -replace "'","''"), ($u.Mail -replace "'","''"), (($u.ProxyAddresses -join ',') -replace "'","''"), ($AssignedLicenses -replace "'","''"), ($type -replace "'","''"), (($u.UsageLocation) -replace "'","''"), $nowIso
-			Invoke-MySQLiteQuery -Path $dbPath -Query $insertAccount | Out-Null
-			if ($mailboxMap.ContainsKey($u.Id)) {
-				$mbType = $mailboxMap[$u.Id]
-				$insertMailbox = @"
-INSERT OR REPLACE INTO MailboxesTarget (objectId, recipientType, mailboxType, lastSeenUtc)
-VALUES ('{0}', '{1}', '{2}', '{3}');
-"@ -f ($u.Id -replace "'","''"), ($mbType -replace "'","''"), ($mbType -replace "'","''"), $nowIso
-				Invoke-MySQLiteQuery -Path $dbPath -Query $insertMailbox | Out-Null
-			}
-		}
-
-		[pscustomobject]@{
-			TargetId         = $u.Id
-			Type             = $type
-			DisplayName      = $u.DisplayName
-			UserPrincipalName= $u.UserPrincipalName
-			EmailAddress     = $u.Mail
-			ProxyAddresses   = ($u.ProxyAddresses -join ',')
-			AssignedLicences = $AssignedLicenses
-		}
-	}
-	if ($OutputPath) {
-		$rows | Export-Csv -Path $OutputPath -NoTypeInformation -Encoding UTF8
-	}
-	if ($UseSqlite -and $dbPath) {
-		Invoke-MySQLiteQuery -Path $dbPath -Query ("UPDATE Tasks SET status = 'Completed', updatedOnUtc = '{0}', message = 'OK' WHERE taskId = '{1}';" -f $nowIso, $taskId) | Out-Null
-		return [pscustomobject]@{ TaskId = $taskId; OutputPath = $OutputPath; Total = $total; Status = 'Completed' }
-	}
-	return $OutputPath
 }
+
 function Resolve-ProjectPath {
 	param([string]$Path)
 
@@ -1860,6 +1873,10 @@ Export-ModuleMember -Function `
 	Start-AccountDiscoveryJob, `
 	Start-CollectMailboxStatisticsJob, `
 	New-MgCustomApp, `
+	Get-MicrosoftProductSheet, `
+	Import-MicrosoftProductSheet, `
+	Get-MSProduct, `
+	Get-MicrosoftOfficeProduct, `
 	Set-ActiveMigrationProject, `
 	Clear-ActiveMigrationProject, `
 	Get-ActiveMigrationProject, `
