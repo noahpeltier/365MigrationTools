@@ -1,0 +1,1 @@
+I want a process to which I match the source accounts to a target account based on an exact match (no case sensitive) to the displayname in the target tenant. If an account matches then it is added to the TargetUPN column in the accounts discovery table.

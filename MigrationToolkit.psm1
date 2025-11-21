@@ -2,6 +2,7 @@
 #$ErrorActionPreference = 'Stop'
 #
 # Default location where profile/config data is stored; overridable per project
+$script:ProductSheetFileName = 'Product names and service plan identifiers for licensing.csv'
 $script:MgProfileDirectory = [Environment]::GetEnvironmentVariable('MG_PROFILE_DIRECTORY')
 if (-not $script:MgProfileDirectory) {
 	$script:MgProfileDirectory = [System.IO.Path]::Combine(
@@ -12,6 +13,149 @@ if (-not $script:MgProfileDirectory) {
 $script:MgConfigPath = [Environment]::GetEnvironmentVariable('MG_CONFIG_PATH')
 if (-not $script:MgConfigPath) {
 	$script:MgConfigPath = Join-Path $PSScriptRoot 'Config.json'
+}
+$script:MicrosoftProductSheetPath = $null
+$script:LastProjectPath = $null
+
+function Get-ProductSheetDefaultPath {
+	param([string]$ProjectPath)
+
+	$basePath = $ProjectPath
+	if (-not $basePath -and $script:ActiveProjectContext -and $script:ActiveProjectContext.ProjectPath) {
+		$basePath = $script:ActiveProjectContext.ProjectPath
+	}
+	if (-not $basePath -and $script:LastProjectPath) {
+		$basePath = $script:LastProjectPath
+	}
+	if (-not $basePath -and $env:MG_CONFIG_PATH) {
+		$basePath = Split-Path -Parent $env:MG_CONFIG_PATH
+	}
+	if (-not $basePath) {
+		$basePath = $PSScriptRoot
+	}
+	$downloadsDir = Join-Path $basePath 'downloads'
+	return Join-Path $downloadsDir $script:ProductSheetFileName
+}
+
+$defaultSheetPath = Get-ProductSheetDefaultPath
+if (Test-Path -LiteralPath $defaultSheetPath) {
+	$script:MicrosoftProductSheetPath = (Resolve-Path -LiteralPath $defaultSheetPath).Path
+}
+$script:MicrosoftProductSheetCache = $null
+
+function Get-MicrosoftProductSheet {
+	[CmdletBinding()]
+	param(
+		[string]$DestinationPath,
+		[string]$ProjectPath,
+		[string]$Uri = 'https://download.microsoft.com/download/e/3/e/e3e9faf2-f28b-490a-9ada-c6089a1fc5b0/Product%20names%20and%20service%20plan%20identifiers%20for%20licensing.csv'
+	)
+
+	if (-not $DestinationPath) {
+		$DestinationPath = Get-ProductSheetDefaultPath -ProjectPath $ProjectPath
+	}
+	$destDir = Split-Path -Parent $DestinationPath
+	if (-not (Test-Path -LiteralPath $destDir)) {
+		New-Item -ItemType Directory -Path $destDir -Force | Out-Null
+	}
+	Invoke-WebRequest -Uri $Uri -OutFile $DestinationPath -UseBasicParsing -ErrorAction Stop | Out-Null
+	$resolved = (Resolve-Path -LiteralPath $DestinationPath).Path
+	$script:MicrosoftProductSheetPath = $resolved
+	$script:MicrosoftProductSheetCache = $null
+	return $resolved
+}
+
+function Import-MicrosoftProductSheet {
+	[CmdletBinding()]
+	param(
+		[string]$Path,
+		[string]$ProjectPath
+	)
+
+	if (-not $Path) {
+		$activeDefault = Get-ProductSheetDefaultPath -ProjectPath $ProjectPath
+		if (Test-Path -LiteralPath $activeDefault) {
+			$Path = $activeDefault
+		}
+		elseif ($script:MicrosoftProductSheetPath -and (Test-Path -LiteralPath $script:MicrosoftProductSheetPath)) {
+			$Path = $script:MicrosoftProductSheetPath
+		}
+		else {
+			$Path = $activeDefault
+		}
+	}
+	if (-not (Test-Path -LiteralPath $Path)) {
+		throw "Product sheet path '$Path' not found. Run Get-MicrosoftProductSheet to download it."
+	}
+	$resolved = (Resolve-Path -LiteralPath $Path).Path
+	$data = Import-Csv -LiteralPath $resolved | ForEach-Object {
+		$pdn = $_.Product_Display_Name
+		if (-not $pdn -and $_.PSObject.Properties.Name -contains '﻿Product_Display_Name') {
+			$pdn = $_.'﻿Product_Display_Name'
+		}
+		[pscustomobject]@{
+			ProductDisplayName            = $pdn
+			StringId                      = $_.String_Id
+			SkuId                         = $_.GUID
+			ServicePlanName               = $_.Service_Plan_Name
+			ServicePlanId                 = $_.Service_Plan_Id
+			ServicePlansIncludedFriendly  = $_.Service_Plans_Included_Friendly_Names
+		}
+	}
+	$script:MicrosoftProductSheetPath = $resolved
+	$script:MicrosoftProductSheetCache = $data
+	return $data
+}
+
+function Get-MSProduct {
+	[CmdletBinding()]
+	param(
+		[string]$SkuId,
+		[string]$StringId,
+		[string]$Name,
+		[string]$ServicePlanId,
+		[string]$ServicePlanName,
+		[switch]$Reload
+	)
+
+	if ($Reload -or -not $script:MicrosoftProductSheetCache) {
+		Import-MicrosoftProductSheet | Out-Null
+	}
+	$rows = $script:MicrosoftProductSheetCache
+
+	if ($SkuId) {
+		$sku = $SkuId.Trim().ToLower()
+		$rows = $rows | Where-Object { ($_.SkuId ?? '').ToLower() -eq $sku }
+	}
+	if ($StringId) {
+		$needle = $StringId.Trim()
+		$rows = $rows | Where-Object { $_.StringId -like "*$needle*" }
+	}
+	if ($Name) {
+		$needle = $Name.Trim()
+		$rows = $rows | Where-Object {
+			($_.ProductDisplayName -like "*$needle*") -or
+			($_.ServicePlansIncludedFriendly -like "*$needle*")
+		}
+	}
+	if ($ServicePlanId) {
+		$plan = $ServicePlanId.Trim().ToLower()
+		$rows = $rows | Where-Object { ($_.ServicePlanId ?? '').ToLower() -eq $plan }
+	}
+	if ($ServicePlanName) {
+		$needle = $ServicePlanName.Trim()
+		$rows = $rows | Where-Object { $_.ServicePlanName -like "*$needle*" }
+	}
+	return $rows
+}
+
+function Get-MicrosoftOfficeProduct {
+	[CmdletBinding()]
+	param(
+		[Parameter(Mandatory)][string]$SkuId
+	)
+
+	return Get-MSProduct -SkuId $SkuId | Select-Object -First 1
 }
 
 function Set-MgProfileDirectory {
@@ -67,6 +211,7 @@ function Get-MigrationProjectContext {
 		throw "Project path '$ProjectPath' does not exist."
 	}
 	$resolvedProject = (Resolve-Path -LiteralPath $ProjectPath).Path
+	$script:LastProjectPath = $resolvedProject
 	$configPath = Join-Path $resolvedProject 'Config.json'
 	if (-not (Test-Path -LiteralPath $configPath)) {
 		throw "Config.json not found at $resolvedProject. Run New-MigrationProject first."
@@ -691,8 +836,7 @@ function Connect-Source {
 		if ($PSBoundParameters.ContainsKey('Verbose')) {
 			$invokeParams['Verbose'] = $true
 		}
-		#return
-		Connect-MgCachedTenant @invokeParams
+		return Connect-MgCachedTenant @invokeParams
 	}
 
 	if (-not $ConfigPath -and $script:ActiveProjectContext) {
@@ -730,8 +874,7 @@ function Connect-Target {
 		if ($PSBoundParameters.ContainsKey('Verbose')) {
 			$invokeParams['Verbose'] = $true
 		}
-		#return 
-		Connect-MgCachedTenant @invokeParams
+		return Connect-MgCachedTenant @invokeParams
 	}
 
 	if (-not $ConfigPath -and $script:ActiveProjectContext) {
@@ -1002,85 +1145,190 @@ function Invoke-MigrateUser {
 	[CmdletBinding()]
 	param(
 		[Parameter(Mandatory)][string]$Source,
-		[Parameter(Mandatory)][string]$Target,
+		[string]$Target,
 		[string]$ProjectPath,
 		[string[]]$Licenses,
-		[Parameter(Mandatory)][string]$Password,
-		[switch]$BlockSignin
+		[Parameter(Mandatory)][System.Security.SecureString]$Password,
+		[switch]$BlockSignin,
+		[hashtable]$SetProperties
 	)
+
+	if (-not $Source -or [string]::IsNullOrWhiteSpace($Source)) {
+		throw "Source UPN is required and cannot be empty."
+	}
+	$Source = $Source.Trim()
 
 	$projectPath = Resolve-ProjectPath $ProjectPath
 	$context = Get-MigrationProjectContext -ProjectPath $projectPath
 
-	$sourceProps = @(
-		'displayName','givenName','surname','mailNickname','jobTitle','department',
-		'officeLocation','businessPhones','mobilePhone','usageLocation'
-	)
-	Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null
-	Connect-ProjectSourceTenant -ProjectPath $context.ProjectPath -Silent | Out-Null
-	try {
-		$srcUser = Get-MgUser -UserId $Source -Property $sourceProps -ErrorAction Stop
-	}
-	finally {
-		Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null
-	}
+	$dbPath = Get-MigrationDatabase -ProjectPath $context.ProjectPath
+	$taskId = [guid]::NewGuid().ToString()
+	$nowIso = (Get-Date).ToUniversalTime().ToString('o')
+	Invoke-MySQLiteQuery -Path $dbPath -Query (@"
+INSERT OR REPLACE INTO Tasks (taskId, name, total, processed, status, message, startedOnUtc, updatedOnUtc)
+VALUES ('{0}', 'MigrateUser', 1, 0, 'Running', '', '{1}', '{1}');
+"@ -f $taskId, $nowIso) | Out-Null
 
-	Connect-ProjectTargetTenant -ProjectPath $context.ProjectPath -Silent | Out-Null
 	try {
+		$sourceProps = @(
+			'displayName','givenName','surname','mailNickname','jobTitle','department',
+			'officeLocation','businessPhones','mobilePhone','usageLocation','userPrincipalName','onPremisesSyncEnabled'
+		)
+
+		# Determine target UPN: prefer provided, then matched in DB, else default domain
+		$targetUpnResolved = $Target
+		if ($targetUpnResolved -and [string]::IsNullOrWhiteSpace($targetUpnResolved)) {
+			$targetUpnResolved = $null
+		}
+		if ($targetUpnResolved) {
+			$targetUpnResolved = $targetUpnResolved.Trim()
+		}
+		$defaultDomain = $context.Config.targetTenant.defaultDomain ?? $context.Config.targetTenant.DefaultDomain
+		$query = "SELECT targetUpn FROM AccountsSource WHERE sourceUpn = '{0}' LIMIT 1;" -f ($Source -replace "'","''")
+		$row = Invoke-MySQLiteQuery -Path $dbPath -Query $query | Select-Object -First 1
+		if (-not $targetUpnResolved -and $row -and $row.targetUpn -and (-not [string]::IsNullOrWhiteSpace($row.targetUpn))) {
+			$targetUpnResolved = $row.targetUpn.Trim()
+		}
+		if (-not $targetUpnResolved) {
+			if (-not $defaultDomain) {
+				throw "Target tenant defaultDomain is missing from Config.json; cannot derive target UPN."
+			}
+			$local = ($Source -split '@')[0]
+			$targetUpnResolved = "$local@$defaultDomain"
+		}
+		if ([string]::IsNullOrWhiteSpace($targetUpnResolved)) {
+			throw "Target UPN resolved to empty; check target tenant defaultDomain and discovery data."
+		}
+
+		# Read source user
+		Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null
+		Connect-ProjectSourceTenant -ProjectPath $context.ProjectPath -Silent | Out-Null
 		try {
-			$existing = Get-MgUser -UserId $Target -ErrorAction Stop
-			if ($existing) { throw "User '$Target' already exists in target tenant." }
+			$srcUser = Get-MgUser -UserId $Source -Property $sourceProps -ErrorAction Stop
 		}
-		catch {
-			$message = $_.Exception.Message
-			if ($message -notmatch 'Request_ResourceNotFound' -and $message -notmatch 'ResourceNotFound' -and $message -notmatch '404') {
-				throw
+		finally {
+			Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null
+		}
+
+		Connect-ProjectTargetTenant -ProjectPath $context.ProjectPath -Silent | Out-Null
+		try {
+			try {
+				$existing = Get-MgUser -UserId $targetUpnResolved -ErrorAction Stop
+				if ($existing) { throw "User '$targetUpnResolved' already exists in target tenant." }
+			}
+			catch {
+				$message = $_.Exception.Message
+				if ($message -notmatch 'Request_ResourceNotFound' -and $message -notmatch 'ResourceNotFound' -and $message -notmatch '404') {
+					throw
+				}
+			}
+
+				$plainPasswordPtr = [IntPtr]::Zero
+				$plainPassword = $null
+				try {
+					if ($Password -is [System.Security.SecureString]) {
+						$plainPasswordPtr = [Runtime.InteropServices.Marshal]::SecureStringToGlobalAllocUnicode($Password)
+						$plainPassword = [Runtime.InteropServices.Marshal]::PtrToStringUni($plainPasswordPtr)
+					}
+					else {
+						$plainPassword = [string]$Password
+					}
+					if ([string]::IsNullOrWhiteSpace($plainPassword)) {
+						throw "Password material is empty; cannot create user."
+					}
+				}
+				finally {
+					if ($plainPasswordPtr -ne [IntPtr]::Zero) {
+						[Runtime.InteropServices.Marshal]::ZeroFreeGlobalAllocUnicode($plainPasswordPtr)
+					}
+				}
+
+				$body = [ordered]@{
+					userPrincipalName = $targetUpnResolved
+					accountEnabled    = (-not $BlockSignin)
+					passwordProfile   = @{
+						password = $plainPassword
+						forceChangePasswordNextSignIn = $true
+					}
+				}
+			if ($srcUser.DisplayName) { $body['displayName'] = $srcUser.DisplayName }
+			if ($srcUser.MailNickname) { $body['mailNickname'] = $srcUser.MailNickname } else {
+				$local = ($targetUpnResolved -split '@')[0]
+				$body['mailNickname'] = $local
+			}
+			if ($srcUser.GivenName) { $body['givenName'] = $srcUser.GivenName }
+			if ($srcUser.Surname) { $body['surname'] = $srcUser.Surname }
+			if ($srcUser.JobTitle) { $body['jobTitle'] = $srcUser.JobTitle }
+			if ($srcUser.Department) { $body['department'] = $srcUser.Department }
+			if ($srcUser.OfficeLocation) { $body['officeLocation'] = $srcUser.OfficeLocation }
+			if ($srcUser.MobilePhone) { $body['mobilePhone'] = $srcUser.MobilePhone }
+			if ($srcUser.BusinessPhones) { $body['businessPhones'] = @($srcUser.BusinessPhones | Where-Object { $_ }) }
+			if ($srcUser.UsageLocation) { $body['usageLocation'] = $srcUser.UsageLocation }
+			elseif ($Licenses -and $Licenses.Count -gt 0) { $body['usageLocation'] = 'US' }
+			if ($SetProperties) {
+				foreach ($key in $SetProperties.Keys) {
+					if ([string]::IsNullOrWhiteSpace([string]$key)) { continue }
+					$body[$key] = $SetProperties[$key]
+				}
+			}
+
+			$newUser = New-MgUser -BodyParameter $body -ErrorAction Stop
+
+			if ($Licenses -and $Licenses.Count -gt 0) {
+				$licenseAdd = @()
+				foreach ($sku in $Licenses) {
+					$licenseAdd += @{ skuId = $sku }
+				}
+				Set-MgUserLicense -UserId $newUser.Id -AddLicenses $licenseAdd -ErrorAction Stop | Out-Null
+			}
+
+			# Update discovery database
+			$nowIso = (Get-Date).ToUniversalTime().ToString('o')
+			$escapedTarget = $targetUpnResolved -replace "'","''"
+			$escapedSource = $Source -replace "'","''"
+			# Source row
+			Invoke-MySQLiteQuery -Path $dbPath -Query (@"
+UPDATE AccountsSource
+SET targetUpn = '{0}',
+    status = 'Matched',
+    lastSeenUtc = '{2}'
+WHERE sourceUpn = '{1}' OR objectId = '{3}';
+"@ -f $escapedTarget, $escapedSource, $nowIso, ($srcUser.Id -replace "'","''")) | Out-Null
+
+			# Target row upsert (minimal)
+			Invoke-MySQLiteQuery -Path $dbPath -Query (@"
+INSERT INTO AccountsTarget (objectId, targetUpn, displayName, mail, proxyAddresses, assignedLicenses, mailboxType, usageLocation, lastSeenUtc, status)
+VALUES ('{0}', '{1}', '{2}', '{3}', '', '', '', '{4}', '{5}', 'Matched')
+ON CONFLICT(objectId) DO UPDATE SET
+	targetUpn = excluded.targetUpn,
+	displayName = excluded.displayName,
+	mail = excluded.mail,
+	usageLocation = excluded.usageLocation,
+	lastSeenUtc = excluded.lastSeenUtc,
+	status = 'Matched';
+"@ -f ($newUser.Id -replace "'","''"), $escapedTarget, (($body.displayName ?? $srcUser.DisplayName) -replace "'","''"), (($body.mail ?? $newUser.Mail) -replace "'","''"), (($body.usageLocation ?? 'US') -replace "'","''"), $nowIso) | Out-Null
+
+			Invoke-MySQLiteQuery -Path $dbPath -Query ("UPDATE Tasks SET processed = 1, status = 'Completed', message = 'OK', updatedOnUtc = '{0}' WHERE taskId = '{1}';" -f $nowIso, $taskId) | Out-Null
+
+			return [pscustomobject]@{
+				SourceUPN = $Source
+				TargetUPN = $targetUpnResolved
+				UserId    = $newUser.Id
+				Licenses  = $Licenses
+				AccountEnabled = (-not $BlockSignin)
 			}
 		}
-
-		$body = [ordered]@{
-			userPrincipalName = $Target
-			accountEnabled    = (-not $BlockSignin)
-			passwordProfile   = @{
-				password = $Password
-				forceChangePasswordNextSignIn = $true
-			}
-		}
-		if ($srcUser.DisplayName) { $body['displayName'] = $srcUser.DisplayName }
-		if ($srcUser.MailNickname) { $body['mailNickname'] = $srcUser.MailNickname } else {
-			$local = ($Target -split '@')[0]
-			$body['mailNickname'] = $local
-		}
-		if ($srcUser.GivenName) { $body['givenName'] = $srcUser.GivenName }
-		if ($srcUser.Surname) { $body['surname'] = $srcUser.Surname }
-		if ($srcUser.JobTitle) { $body['jobTitle'] = $srcUser.JobTitle }
-		if ($srcUser.Department) { $body['department'] = $srcUser.Department }
-		if ($srcUser.OfficeLocation) { $body['officeLocation'] = $srcUser.OfficeLocation }
-		if ($srcUser.MobilePhone) { $body['mobilePhone'] = $srcUser.MobilePhone }
-		if ($srcUser.BusinessPhones) { $body['businessPhones'] = @($srcUser.BusinessPhones | Where-Object { $_ }) }
-		if ($srcUser.UsageLocation) { $body['usageLocation'] = $srcUser.UsageLocation }
-		elseif ($Licenses -and $Licenses.Count -gt 0) { $body['usageLocation'] = 'US' }
-
-		$newUser = New-MgUser -BodyParameter $body -ErrorAction Stop
-
-		if ($Licenses -and $Licenses.Count -gt 0) {
-			$licenseAdd = @()
-			foreach ($sku in $Licenses) {
-				$licenseAdd += @{ skuId = $sku }
-			}
-			Set-MgUserLicense -UserId $newUser.Id -AddLicenses $licenseAdd -ErrorAction Stop | Out-Null
-		}
-
-		return [pscustomobject]@{
-			SourceUPN = $Source
-			TargetUPN = $Target
-			UserId    = $newUser.Id
-			Licenses  = $Licenses
-			AccountEnabled = (-not $BlockSignin)
+		finally {
+			Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null
 		}
 	}
-	finally {
-		Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null
+	catch {
+		if ($dbPath -and $taskId) {
+			$errIso = (Get-Date).ToUniversalTime().ToString('o')
+			$errMsg = $_.Exception.Message -replace "'","''"
+			Invoke-MySQLiteQuery -Path $dbPath -Query ("UPDATE Tasks SET status = 'Failed', message = '{0}', updatedOnUtc = '{1}' WHERE taskId = '{2}';" -f $errMsg, $errIso, $taskId) | Out-Null
+		}
+		throw
 	}
 }
 
@@ -1088,8 +1336,7 @@ function Invoke-DiscoverSourceAccounts {
     [CmdletBinding()]
     param(
         [string]$ProjectPath,
-        [string]$OutputPath,
-        [switch]$UseSqlite
+        [string]$OutputPath
     )
 
     $projectPath = Resolve-ProjectPath $ProjectPath
@@ -1098,37 +1345,32 @@ function Invoke-DiscoverSourceAccounts {
         $OutputPath = Join-Path $context.ProjectPath 'DiscoveredAccounts.csv'
     }
 
-    $dbPath = $null
+    $dbPath = Get-MigrationDatabase -ProjectPath $context.ProjectPath
     $taskId = [guid]::NewGuid().ToString()
     $statusUpdated = $false
-    if ($UseSqlite) {
-        $dbPath = Get-MigrationDatabase -ProjectPath $context.ProjectPath
-        $nowIso = (Get-Date).ToUniversalTime().ToString('o')
-        Invoke-MySQLiteQuery -Path $dbPath -Query (@"
+    $nowIso = (Get-Date).ToUniversalTime().ToString('o')
+    Invoke-MySQLiteQuery -Path $dbPath -Query (@"
 INSERT OR REPLACE INTO Tasks (taskId, name, total, processed, status, message, startedOnUtc, updatedOnUtc)
 VALUES ('{0}', 'DiscoverSourceAccounts', 0, 0, 'Running', '', '{1}', '{1}');
 "@ -f $taskId, $nowIso) | Out-Null
-    }
 
     try {
         Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null
         Connect-ProjectSourceTenant -ProjectPath $context.ProjectPath -Silent | Out-Null
         $users = $null
         try {
-            $users = Get-MgUser -All -Property 'id','displayName','userPrincipalName','mail','proxyAddresses','assignedLicenses' -ErrorAction Stop |
-                Select-Object 'id','displayName','userPrincipalName','mail','proxyAddresses','assignedLicenses'
+            $users = Get-MgUser -All -Property 'id','displayName','userPrincipalName','mail','proxyAddresses','assignedLicenses','onPremisesSyncEnabled' -ErrorAction Stop |
+                Select-Object 'id','displayName','userPrincipalName','mail','proxyAddresses','assignedLicenses','onPremisesSyncEnabled'
         }
         finally {
             Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null
         }
 
         $total = @($users).Count
-        if ($UseSqlite -and $dbPath) {
-            $nowIso = (Get-Date).ToUniversalTime().ToString('o')
-            Invoke-MySQLiteQuery -Path $dbPath -Query (@"
+        $nowIso = (Get-Date).ToUniversalTime().ToString('o')
+        Invoke-MySQLiteQuery -Path $dbPath -Query (@"
 UPDATE Tasks SET total = {0}, updatedOnUtc = '{1}' WHERE taskId = '{2}';
 "@ -f $total, $nowIso, $taskId) | Out-Null
-        }
 
         $mailboxMap = @{}
         try {
@@ -1163,27 +1405,37 @@ UPDATE Tasks SET total = {0}, updatedOnUtc = '{1}' WHERE taskId = '{2}';
 
             $assignedSkus = @()
             if ($u.AssignedLicenses) {
-                $assignedSkus = @($u.AssignedLicenses | ForEach-Object { (Get-MicrosoftOfficeProduct -SkuId $_.SkuId).Product_Display_Name })
+                $assignedSkus = @($u.AssignedLicenses | ForEach-Object { (Get-MicrosoftOfficeProduct -SkuId $_.SkuId).ProductDisplayName })
             }
             $AssignedLicenses = ($assignedSkus -join ",")
+            $syncStatus = if ($u.onPremisesSyncEnabled) { 'ADSync' } else { 'In Cloud' }
 
-            if ($UseSqlite -and $dbPath) {
-                $nowLoop = (Get-Date).ToUniversalTime().ToString('o')
-                $insertAccount = @"
-INSERT OR REPLACE INTO AccountsSource (objectId, sourceUpn, displayName, mail, proxyAddresses, assignedLicenses, mailboxType, usageLocation, lastSeenUtc)
-VALUES ('{0}', '{1}', '{2}', '{3}', '{4}', '{5}', '{6}', '{7}', '{8}');
-"@ -f ($u.Id -replace "'","''"), ($u.UserPrincipalName -replace "'","''"), ($u.DisplayName -replace "'","''"), ($u.Mail -replace "'","''"), (($u.ProxyAddresses -join ',') -replace "'","''"), ($AssignedLicenses -replace "'","''"), ($type -replace "'","''"), (($u.UsageLocation) -replace "'","''"), $nowLoop
-                Invoke-MySQLiteQuery -Path $dbPath -Query $insertAccount | Out-Null
-                if ($mailboxMap.ContainsKey($u.Id)) {
-                    $mbType = $mailboxMap[$u.Id]
-                    $insertMailbox = @"
+            $nowLoop = (Get-Date).ToUniversalTime().ToString('o')
+            $insertAccount = @"
+INSERT INTO AccountsSource (objectId, sourceUpn, displayName, mail, proxyAddresses, assignedLicenses, mailboxType, usageLocation, lastSeenUtc, status, syncStatus)
+VALUES ('{0}', '{1}', '{2}', '{3}', '{4}', '{5}', '{6}', '{7}', '{8}', 'Discovered', '{9}')
+ON CONFLICT(objectId) DO UPDATE SET
+	sourceUpn = excluded.sourceUpn,
+	displayName = excluded.displayName,
+	mail = excluded.mail,
+	proxyAddresses = excluded.proxyAddresses,
+	assignedLicenses = excluded.assignedLicenses,
+	mailboxType = excluded.mailboxType,
+	usageLocation = excluded.usageLocation,
+	lastSeenUtc = excluded.lastSeenUtc,
+	syncStatus = excluded.syncStatus,
+	status = CASE WHEN AccountsSource.targetUpn IS NOT NULL THEN 'Matched' ELSE 'Discovered' END;
+"@ -f ($u.Id -replace "'","''"), ($u.UserPrincipalName -replace "'","''"), ($u.DisplayName -replace "'","''"), ($u.Mail -replace "'","''"), (($u.ProxyAddresses -join ',') -replace "'","''"), ($AssignedLicenses -replace "'","''"), ($type -replace "'","''"), (($u.UsageLocation) -replace "'","''"), $nowLoop, ($syncStatus -replace "'","''")
+            Invoke-MySQLiteQuery -Path $dbPath -Query $insertAccount | Out-Null
+            if ($mailboxMap.ContainsKey($u.Id)) {
+                $mbType = $mailboxMap[$u.Id]
+                $insertMailbox = @"
 INSERT OR REPLACE INTO MailboxesSource (objectId, recipientType, mailboxType, lastSeenUtc)
 VALUES ('{0}', '{1}', '{2}', '{3}');
 "@ -f ($u.Id -replace "'","''"), ($mbType -replace "'","''"), ($mbType -replace "'","''"), $nowLoop
-                    Invoke-MySQLiteQuery -Path $dbPath -Query $insertMailbox | Out-Null
-                }
-                Invoke-MySQLiteQuery -Path $dbPath -Query ("UPDATE Tasks SET processed = processed + 1, updatedOnUtc = '{0}' WHERE taskId = '{1}';" -f (Get-Date).ToUniversalTime().ToString('o'), $taskId) | Out-Null
+                Invoke-MySQLiteQuery -Path $dbPath -Query $insertMailbox | Out-Null
             }
+            Invoke-MySQLiteQuery -Path $dbPath -Query ("UPDATE Tasks SET processed = processed + 1, updatedOnUtc = '{0}' WHERE taskId = '{1}';" -f (Get-Date).ToUniversalTime().ToString('o'), $taskId) | Out-Null
 
             [pscustomobject]@{
                 SourceId          = $u.Id
@@ -1199,16 +1451,13 @@ VALUES ('{0}', '{1}', '{2}', '{3}');
         if ($OutputPath) {
             $rows | Export-Csv -Path $OutputPath -NoTypeInformation -Encoding UTF8
         }
-        if ($UseSqlite -and $dbPath) {
-            $nowIso = (Get-Date).ToUniversalTime().ToString('o')
-            Invoke-MySQLiteQuery -Path $dbPath -Query ("UPDATE Tasks SET status = 'Completed', updatedOnUtc = '{0}', message = 'OK' WHERE taskId = '{1}';" -f $nowIso, $taskId) | Out-Null
-            $statusUpdated = $true
-            return [pscustomobject]@{ TaskId = $taskId; OutputPath = $OutputPath; Total = $total; Status = 'Completed' }
-        }
-        return $OutputPath
+        $nowIso = (Get-Date).ToUniversalTime().ToString('o')
+        Invoke-MySQLiteQuery -Path $dbPath -Query ("UPDATE Tasks SET status = 'Completed', updatedOnUtc = '{0}', message = 'OK' WHERE taskId = '{1}';" -f $nowIso, $taskId) | Out-Null
+        $statusUpdated = $true
+        return [pscustomobject]@{ TaskId = $taskId; OutputPath = $OutputPath; Total = $total; Status = 'Completed' }
     }
     catch {
-        if ($UseSqlite -and $dbPath -and -not $statusUpdated) {
+        if ($dbPath -and -not $statusUpdated) {
             $errMsg = $_.Exception.Message -replace "'","''"
             Invoke-MySQLiteQuery -Path $dbPath -Query ("UPDATE Tasks SET status = 'Failed', message = '{0}', updatedOnUtc = '{1}' WHERE taskId = '{2}';" -f $errMsg, (Get-Date).ToUniversalTime().ToString('o'), $taskId) | Out-Null
         }
@@ -1219,8 +1468,7 @@ function Invoke-DiscoverTargetAccounts {
     [CmdletBinding()]
     param(
         [string]$ProjectPath,
-        [string]$OutputPath,
-        [switch]$UseSqlite
+        [string]$OutputPath
     )
 
     $projectPath = Resolve-ProjectPath $ProjectPath
@@ -1229,17 +1477,14 @@ function Invoke-DiscoverTargetAccounts {
         $OutputPath = Join-Path $context.ProjectPath 'DiscoveredTargetAccounts.csv'
     }
 
-    $dbPath = $null
+    $dbPath = Get-MigrationDatabase -ProjectPath $context.ProjectPath
     $taskId = [guid]::NewGuid().ToString()
     $statusUpdated = $false
-    if ($UseSqlite) {
-        $dbPath = Get-MigrationDatabase -ProjectPath $context.ProjectPath
-        $nowIso = (Get-Date).ToUniversalTime().ToString('o')
-        Invoke-MySQLiteQuery -Path $dbPath -Query (@"
+    $nowIso = (Get-Date).ToUniversalTime().ToString('o')
+    Invoke-MySQLiteQuery -Path $dbPath -Query (@"
 INSERT OR REPLACE INTO Tasks (taskId, name, total, processed, status, message, startedOnUtc, updatedOnUtc)
 VALUES ('{0}', 'DiscoverTargetAccounts', 0, 0, 'Running', '', '{1}', '{1}');
 "@ -f $taskId, $nowIso) | Out-Null
-    }
 
     try {
         Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null
@@ -1254,12 +1499,10 @@ VALUES ('{0}', 'DiscoverTargetAccounts', 0, 0, 'Running', '', '{1}', '{1}');
         }
 
         $total = @($users).Count
-        if ($UseSqlite -and $dbPath) {
-            $nowIso = (Get-Date).ToUniversalTime().ToString('o')
-            Invoke-MySQLiteQuery -Path $dbPath -Query (@"
+        $nowIso = (Get-Date).ToUniversalTime().ToString('o')
+        Invoke-MySQLiteQuery -Path $dbPath -Query (@"
 UPDATE Tasks SET total = {0}, updatedOnUtc = '{1}' WHERE taskId = '{2}';
 "@ -f $total, $nowIso, $taskId) | Out-Null
-        }
 
         $mailboxMap = @{}
         try {
@@ -1290,31 +1533,39 @@ UPDATE Tasks SET total = {0}, updatedOnUtc = '{1}' WHERE taskId = '{2}';
             }
             else {
                 $type = 'NonMailEnabledUser'
-            }
+	        }
 
-            $assignedSkus = @()
-            if ($u.AssignedLicenses) {
-                $assignedSkus = @($u.AssignedLicenses | ForEach-Object { (Get-MicrosoftOfficeProduct -SkuId $_.SkuId).Product_Display_Name })
-            }
-            $AssignedLicenses = ($assignedSkus -join ",")
+	        $assignedSkus = @()
+	        if ($u.AssignedLicenses) {
+	            $assignedSkus = @($u.AssignedLicenses | ForEach-Object { (Get-MicrosoftOfficeProduct -SkuId $_.SkuId).ProductDisplayName })
+	        }
+		        $AssignedLicenses = ($assignedSkus -join ",")
 
-            if ($UseSqlite -and $dbPath) {
-                $nowLoop = (Get-Date).ToUniversalTime().ToString('o')
-                $insertAccount = @"
-INSERT OR REPLACE INTO AccountsTarget (objectId, targetUpn, displayName, mail, proxyAddresses, assignedLicenses, mailboxType, usageLocation, lastSeenUtc)
-VALUES ('{0}', '{1}', '{2}', '{3}', '{4}', '{5}', '{6}', '{7}', '{8}');
+            $nowLoop = (Get-Date).ToUniversalTime().ToString('o')
+			$insertAccount = @"
+INSERT INTO AccountsTarget (objectId, targetUpn, displayName, mail, proxyAddresses, assignedLicenses, mailboxType, usageLocation, lastSeenUtc, status)
+VALUES ('{0}', '{1}', '{2}', '{3}', '{4}', '{5}', '{6}', '{7}', '{8}', 'Discovered')
+ON CONFLICT(objectId) DO UPDATE SET
+	targetUpn = excluded.targetUpn,
+	displayName = excluded.displayName,
+	mail = excluded.mail,
+	proxyAddresses = excluded.proxyAddresses,
+	assignedLicenses = excluded.assignedLicenses,
+	mailboxType = excluded.mailboxType,
+	usageLocation = excluded.usageLocation,
+	lastSeenUtc = excluded.lastSeenUtc,
+	status = 'Discovered';
 "@ -f ($u.Id -replace "'","''"), ($u.UserPrincipalName -replace "'","''"), ($u.DisplayName -replace "'","''"), ($u.Mail -replace "'","''"), (($u.ProxyAddresses -join ',') -replace "'","''"), ($AssignedLicenses -replace "'","''"), ($type -replace "'","''"), (($u.UsageLocation) -replace "'","''"), $nowLoop
-                Invoke-MySQLiteQuery -Path $dbPath -Query $insertAccount | Out-Null
-                if ($mailboxMap.ContainsKey($u.Id)) {
-                    $mbType = $mailboxMap[$u.Id]
-                    $insertMailbox = @"
+            Invoke-MySQLiteQuery -Path $dbPath -Query $insertAccount | Out-Null
+            if ($mailboxMap.ContainsKey($u.Id)) {
+                $mbType = $mailboxMap[$u.Id]
+                $insertMailbox = @"
 INSERT OR REPLACE INTO MailboxesTarget (objectId, recipientType, mailboxType, lastSeenUtc)
 VALUES ('{0}', '{1}', '{2}', '{3}');
 "@ -f ($u.Id -replace "'","''"), ($mbType -replace "'","''"), ($mbType -replace "'","''"), $nowLoop
-                    Invoke-MySQLiteQuery -Path $dbPath -Query $insertMailbox | Out-Null
-                }
-                Invoke-MySQLiteQuery -Path $dbPath -Query ("UPDATE Tasks SET processed = processed + 1, updatedOnUtc = '{0}' WHERE taskId = '{1}';" -f (Get-Date).ToUniversalTime().ToString('o'), $taskId) | Out-Null
+                Invoke-MySQLiteQuery -Path $dbPath -Query $insertMailbox | Out-Null
             }
+            Invoke-MySQLiteQuery -Path $dbPath -Query ("UPDATE Tasks SET processed = processed + 1, updatedOnUtc = '{0}' WHERE taskId = '{1}';" -f (Get-Date).ToUniversalTime().ToString('o'), $taskId) | Out-Null
 
             [pscustomobject]@{
                 TargetId          = $u.Id
@@ -1330,122 +1581,20 @@ VALUES ('{0}', '{1}', '{2}', '{3}');
         if ($OutputPath) {
             $rows | Export-Csv -Path $OutputPath -NoTypeInformation -Encoding UTF8
         }
-        if ($UseSqlite -and $dbPath) {
-            $nowIso = (Get-Date).ToUniversalTime().ToString('o')
-            Invoke-MySQLiteQuery -Path $dbPath -Query ("UPDATE Tasks SET status = 'Completed', updatedOnUtc = '{0}', message = 'OK' WHERE taskId = '{1}';" -f $nowIso, $taskId) | Out-Null
-            $statusUpdated = $true
-            return [pscustomobject]@{ TaskId = $taskId; OutputPath = $OutputPath; Total = $total; Status = 'Completed' }
-        }
-        return $OutputPath
+        $nowIso = (Get-Date).ToUniversalTime().ToString('o')
+        Invoke-MySQLiteQuery -Path $dbPath -Query ("UPDATE Tasks SET status = 'Completed', updatedOnUtc = '{0}', message = 'OK' WHERE taskId = '{1}';" -f $nowIso, $taskId) | Out-Null
+        $statusUpdated = $true
+        return [pscustomobject]@{ TaskId = $taskId; OutputPath = $OutputPath; Total = $total; Status = 'Completed' }
     }
     catch {
-        if ($UseSqlite -and $dbPath -and -not $statusUpdated) {
+        if ($dbPath -and -not $statusUpdated) {
             $errMsg = $_.Exception.Message -replace "'","''"
             Invoke-MySQLiteQuery -Path $dbPath -Query ("UPDATE Tasks SET status = 'Failed', message = '{0}', updatedOnUtc = '{1}' WHERE taskId = '{2}';" -f $errMsg, (Get-Date).ToUniversalTime().ToString('o'), $taskId) | Out-Null
         }
         throw
     }
-}function Invoke-DiscoverTargetAccounts {
-	[CmdletBinding()]
-	param(
-		[string]$ProjectPath,
-		[string]$OutputPath,
-		[switch]$UseSqlite
-	)
-
-	$projectPath = Resolve-ProjectPath $ProjectPath
-	$context = Get-MigrationProjectContext -ProjectPath $projectPath
-	if (-not $OutputPath) {
-		$OutputPath = Join-Path $context.ProjectPath 'DiscoveredTargetAccounts.csv'
-	}
-	$dbPath = $null
-	$nowIso = (Get-Date).ToUniversalTime().ToString('o')
-	if ($UseSqlite) {
-		$dbPath = Get-MigrationDatabase -ProjectPath $context.ProjectPath
-	}
-
-	Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null
-	Connect-ProjectTargetTenant -ProjectPath $context.ProjectPath -Silent | Out-Null
-	$users = $null
-	try {
-		$users = Get-MgUser -All -Property 'id','displayName','userPrincipalName','mail','proxyAddresses','assignedLicenses'  -ErrorAction Stop |
-		Select-Object 'id','displayName','userPrincipalName','mail','proxyAddresses','assignedLicenses'
-	}
-	finally {
-		Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null
-	}
-
-	$mailboxMap = @{}
-	try {
-		Connect-ProjectTargetExchange -ProjectPath $context.ProjectPath | Out-Null
-		try {
-			$recipients = Get-EXORecipient -ResultSize Unlimited -PropertySets All -ErrorAction Stop
-			foreach ($recip in $recipients) {
-				if ($recip.ExternalDirectoryObjectId) {
-					$mailboxMap[$recip.ExternalDirectoryObjectId] = $recip.RecipientTypeDetails
-				}
-			}
-		}
-		finally {
-			Disconnect-ExchangeOnline -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
-		}
-	}
-	catch {
-		Write-Warning "Exchange discovery (target) failed: $($_.Exception.Message). Mailbox type will be blank."
-	}
-	$rows = foreach ($u in $users) {
-		$type = $null
-		if ($mailboxMap.ContainsKey($u.Id)) {
-			$type = $mailboxMap[$u.Id]
-		}
-		elseif ($u.Mail -or ($u.ProxyAddresses -and $u.ProxyAddresses.Count -gt 0)) {
-			$type = 'MailEnabledUser'
-		}
-		else {
-			$type = 'NonMailEnabledUser'
-		}
-
-		$assignedSkus = @()
-		if ($u.AssignedLicenses) {
-			$assignedSkus = @($u.AssignedLicenses | ForEach-Object { (Get-MicrosoftOfficeProduct -SkuId $_.SkuId).Product_Display_Name })
-		}
-		$AssignedLicenses = ($assignedSkus -join ",")
-
-		if ($UseSqlite -and $dbPath) {
-			$insertAccount = @"
-INSERT OR REPLACE INTO AccountsTarget (objectId, targetUpn, displayName, mail, proxyAddresses, assignedLicenses, mailboxType, usageLocation, lastSeenUtc)
-VALUES ('{0}', '{1}', '{2}', '{3}', '{4}', '{5}', '{6}', '{7}', '{8}');
-"@ -f ($u.Id -replace "'","''"), ($u.UserPrincipalName -replace "'","''"), ($u.DisplayName -replace "'","''"), ($u.Mail -replace "'","''"), (($u.ProxyAddresses -join ',') -replace "'","''"), ($AssignedLicenses -replace "'","''"), ($type -replace "'","''"), (($u.UsageLocation) -replace "'","''"), $nowIso
-			Invoke-MySQLiteQuery -Path $dbPath -Query $insertAccount | Out-Null
-			if ($mailboxMap.ContainsKey($u.Id)) {
-				$mbType = $mailboxMap[$u.Id]
-				$insertMailbox = @"
-INSERT OR REPLACE INTO MailboxesTarget (objectId, recipientType, mailboxType, lastSeenUtc)
-VALUES ('{0}', '{1}', '{2}', '{3}');
-"@ -f ($u.Id -replace "'","''"), ($mbType -replace "'","''"), ($mbType -replace "'","''"), $nowIso
-				Invoke-MySQLiteQuery -Path $dbPath -Query $insertMailbox | Out-Null
-			}
-		}
-
-		[pscustomobject]@{
-			TargetId         = $u.Id
-			Type             = $type
-			DisplayName      = $u.DisplayName
-			UserPrincipalName= $u.UserPrincipalName
-			EmailAddress     = $u.Mail
-			ProxyAddresses   = ($u.ProxyAddresses -join ',')
-			AssignedLicences = $AssignedLicenses
-		}
-	}
-	if ($OutputPath) {
-		$rows | Export-Csv -Path $OutputPath -NoTypeInformation -Encoding UTF8
-	}
-	if ($UseSqlite -and $dbPath) {
-		Invoke-MySQLiteQuery -Path $dbPath -Query ("UPDATE Tasks SET status = 'Completed', updatedOnUtc = '{0}', message = 'OK' WHERE taskId = '{1}';" -f $nowIso, $taskId) | Out-Null
-		return [pscustomobject]@{ TaskId = $taskId; OutputPath = $OutputPath; Total = $total; Status = 'Completed' }
-	}
-	return $OutputPath
 }
+
 function Resolve-ProjectPath {
 	param([string]$Path)
 
@@ -1492,8 +1641,8 @@ function Get-MigrationDatabase {
 	Invoke-MySQLiteQuery -Path $dbPath -Query "PRAGMA busy_timeout=5000;" | Out-Null
 	$createStatements = @(
 		"CREATE TABLE IF NOT EXISTS Metadata (schemaVersion INTEGER)",
-		"CREATE TABLE IF NOT EXISTS AccountsSource (objectId TEXT PRIMARY KEY, sourceUpn TEXT, displayName TEXT, mail TEXT, proxyAddresses TEXT, assignedLicenses TEXT, mailboxType TEXT, usageLocation TEXT, lastSeenUtc TEXT)",
-		"CREATE TABLE IF NOT EXISTS AccountsTarget (objectId TEXT PRIMARY KEY, targetUpn TEXT, displayName TEXT, mail TEXT, proxyAddresses TEXT, assignedLicenses TEXT, mailboxType TEXT, usageLocation TEXT, lastSeenUtc TEXT)",
+		"CREATE TABLE IF NOT EXISTS AccountsSource (objectId TEXT PRIMARY KEY, sourceUpn TEXT, displayName TEXT, mail TEXT, proxyAddresses TEXT, assignedLicenses TEXT, mailboxType TEXT, usageLocation TEXT, lastSeenUtc TEXT, targetUpn TEXT, status TEXT, syncStatus TEXT)",
+		"CREATE TABLE IF NOT EXISTS AccountsTarget (objectId TEXT PRIMARY KEY, targetUpn TEXT, displayName TEXT, mail TEXT, proxyAddresses TEXT, assignedLicenses TEXT, mailboxType TEXT, usageLocation TEXT, lastSeenUtc TEXT, status TEXT)",
 		"CREATE TABLE IF NOT EXISTS MailboxesSource (objectId TEXT PRIMARY KEY, recipientType TEXT, mailboxSize TEXT, itemCount INTEGER, archiveSize TEXT, lastLogon TEXT, forwarding TEXT, holdFlags TEXT, mailboxType TEXT, lastSeenUtc TEXT)",
 		"CREATE TABLE IF NOT EXISTS MailboxesTarget (objectId TEXT PRIMARY KEY, recipientType TEXT, mailboxSize TEXT, itemCount INTEGER, archiveSize TEXT, lastLogon TEXT, forwarding TEXT, holdFlags TEXT, mailboxType TEXT, lastSeenUtc TEXT)"
 	)
@@ -1509,8 +1658,301 @@ function Get-MigrationDatabase {
 	}
 	$ensureColumn.Invoke('MailboxesSource', 'mailboxType')
 	$ensureColumn.Invoke('MailboxesTarget', 'mailboxType')
+	$ensureColumn.Invoke('AccountsSource', 'targetUpn')
+	$ensureColumn.Invoke('AccountsSource', 'status')
+	$ensureColumn.Invoke('AccountsSource', 'syncStatus')
+	$ensureColumn.Invoke('AccountsTarget', 'status')
 	Invoke-MySQLiteQuery -Path $dbPath -Query "CREATE TABLE IF NOT EXISTS Tasks (taskId TEXT PRIMARY KEY, name TEXT, total INTEGER, processed INTEGER, status TEXT, message TEXT, startedOnUtc TEXT, updatedOnUtc TEXT);" | Out-Null
 	return $dbPath
+}
+
+function Set-AccountMatchesByDisplayName {
+	[CmdletBinding()]
+	param(
+		[string]$ProjectPath
+	)
+
+	$dbPath = Get-MigrationDatabase -ProjectPath (Resolve-ProjectPath $ProjectPath)
+
+	# Gather ambiguous display names in target (case-insensitive)
+	$ambiguous = Invoke-MySQLiteQuery -Path $dbPath -Query @"
+SELECT lower(displayName) AS name, COUNT(*) AS count
+FROM AccountsTarget
+GROUP BY lower(displayName)
+HAVING COUNT(*) > 1;
+"@
+
+	$beforeMatched = Invoke-MySQLiteQuery -Path $dbPath -Query "SELECT COUNT(*) AS c FROM AccountsSource WHERE targetUpn IS NOT NULL;" | Select-Object -First 1
+
+	# Only update when the target display name is unique (case-insensitive)
+	Invoke-MySQLiteQuery -Path $dbPath -Query @"
+WITH ambiguous AS (
+    SELECT lower(displayName) AS name
+    FROM AccountsTarget
+    GROUP BY lower(displayName)
+    HAVING COUNT(*) > 1
+)
+UPDATE AccountsSource
+SET targetUpn = (
+    SELECT targetUpn
+    FROM AccountsTarget t
+    WHERE lower(t.displayName) = lower(AccountsSource.displayName)
+    ORDER BY targetUpn
+    LIMIT 1
+)
+WHERE lower(displayName) NOT IN (SELECT name FROM ambiguous)
+  AND EXISTS (
+    SELECT 1 FROM AccountsTarget t2
+    WHERE lower(t2.displayName) = lower(AccountsSource.displayName)
+);
+"@ | Out-Null
+
+	$afterMatched = Invoke-MySQLiteQuery -Path $dbPath -Query "SELECT COUNT(*) AS c FROM AccountsSource WHERE targetUpn IS NOT NULL;" | Select-Object -First 1
+	$delta = ($afterMatched.c ?? $afterMatched.C) - ($beforeMatched.c ?? $beforeMatched.C)
+
+	Invoke-MySQLiteQuery -Path $dbPath -Query "UPDATE AccountsSource SET status = CASE WHEN targetUpn IS NULL THEN 'Discovered' ELSE 'Matched' END;" | Out-Null
+
+	return [pscustomobject]@{
+		DatabasePath      = $dbPath
+		MatchedUpdated    = $delta
+		TotalMatched      = ($afterMatched.c ?? $afterMatched.C)
+		AmbiguousDisplayNames = ($ambiguous | Select-Object -ExpandProperty name)
+	}
+}
+
+function Invoke-MatchAccountsByDisplayName {
+	[CmdletBinding()]
+	param(
+		[string]$ProjectPath
+	)
+
+	$context = Get-MigrationProjectContext -ProjectPath (Resolve-ProjectPath $ProjectPath)
+	$dbPath = Get-MigrationDatabase -ProjectPath $context.ProjectPath
+
+	$taskId = [guid]::NewGuid().ToString()
+	$nowIso = (Get-Date).ToUniversalTime().ToString('o')
+	Invoke-MySQLiteQuery -Path $dbPath -Query (@"
+INSERT OR REPLACE INTO Tasks (taskId, name, total, processed, status, message, startedOnUtc, updatedOnUtc)
+VALUES ('{0}', 'MatchAccountsByDisplayName', 0, 0, 'Running', '', '{1}', '{1}');
+"@ -f $taskId, $nowIso) | Out-Null
+
+	$matched = 0
+	$processed = 0
+	$ambiguousNames = @()
+	$sourceAccounts = Invoke-MySQLiteQuery -Path $dbPath -Query "SELECT objectId, displayName FROM AccountsSource;"
+	$totalSources = @($sourceAccounts).Count
+
+	try {
+		if ($totalSources -gt 0) {
+			Invoke-MySQLiteQuery -Path $dbPath -Query ("UPDATE Tasks SET total = {0}, updatedOnUtc = '{1}' WHERE taskId = '{2}';" -f $totalSources, (Get-Date).ToUniversalTime().ToString('o'), $taskId) | Out-Null
+		}
+
+		Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null
+		Connect-ProjectTargetTenant -ProjectPath $context.ProjectPath -Silent | Out-Null
+		$targetUsers = @()
+		try {
+			$targetUsers = Get-MgUser -All -Property 'displayName','userPrincipalName' -ErrorAction Stop |
+				Select-Object displayName, userPrincipalName
+		}
+		finally {
+			Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null
+		}
+
+		# Build maps of displayName (lower) -> upn list
+		$displayGroups = @{}
+		foreach ($u in $targetUsers) {
+			if (-not $u.DisplayName) { continue }
+			$key = $u.DisplayName.ToLower()
+			if (-not $displayGroups.ContainsKey($key)) {
+				$displayGroups[$key] = @()
+			}
+			$displayGroups[$key] += $u.UserPrincipalName
+		}
+		$ambiguousNames = $displayGroups.GetEnumerator() | Where-Object { $_.Value.Count -gt 1 } | ForEach-Object { $_.Key }
+
+		foreach ($row in $sourceAccounts) {
+			$processed++
+			$dn = $row.displayName
+			$objectId = $row.objectId
+			$targetUpn = $null
+			if ($dn) {
+				$key = $dn.ToLower()
+				if ($displayGroups.ContainsKey($key) -and $displayGroups[$key].Count -eq 1) {
+					$targetUpn = $displayGroups[$key][0]
+					$matched++
+				}
+			}
+			$escapedUpn = if ($targetUpn) { $targetUpn -replace "'","''" } else { $null }
+			$escapedId = $objectId -replace "'","''"
+			if ($targetUpn) {
+				Invoke-MySQLiteQuery -Path $dbPath -Query ("UPDATE AccountsSource SET targetUpn = '{0}', lastSeenUtc = '{2}', status = 'Matched' WHERE objectId = '{1}';" -f $escapedUpn, $escapedId, (Get-Date).ToUniversalTime().ToString('o')) | Out-Null
+			}
+			else {
+				Invoke-MySQLiteQuery -Path $dbPath -Query ("UPDATE AccountsSource SET targetUpn = NULL, status = 'Discovered' WHERE objectId = '{0}';" -f $escapedId) | Out-Null
+			}
+			Invoke-MySQLiteQuery -Path $dbPath -Query ("UPDATE Tasks SET processed = processed + 1, updatedOnUtc = '{0}' WHERE taskId = '{1}';" -f (Get-Date).ToUniversalTime().ToString('o'), $taskId) | Out-Null
+		}
+
+		$doneIso = (Get-Date).ToUniversalTime().ToString('o')
+		Invoke-MySQLiteQuery -Path $dbPath -Query ("UPDATE Tasks SET status = 'Completed', message = 'Matched {0} accounts', updatedOnUtc = '{1}' WHERE taskId = '{2}';" -f $matched, $doneIso, $taskId) | Out-Null
+
+		return [pscustomobject]@{
+			TaskId                = $taskId
+			DatabasePath          = $dbPath
+			Matched               = $matched
+			Processed             = $processed
+			TotalSources          = $totalSources
+			AmbiguousDisplayNames = $ambiguousNames
+		}
+	}
+	catch {
+		$errIso = (Get-Date).ToUniversalTime().ToString('o')
+		$errMsg = $_.Exception.Message -replace "'","''"
+		Invoke-MySQLiteQuery -Path $dbPath -Query ("UPDATE Tasks SET status = 'Failed', message = '{0}', updatedOnUtc = '{1}' WHERE taskId = '{2}';" -f $errMsg, $errIso, $taskId) | Out-Null
+		throw
+	}
+}
+
+function Start-ProjectMatchAccountsTask {
+	[CmdletBinding()]
+	param(
+		[string]$ProjectPath
+	)
+
+	Assert-ThreadJobAvailable
+	$modulePath = $MyInvocation.MyCommand.Module.Path
+	$proj = Resolve-ProjectPath $ProjectPath
+	$jobName = "Match-AccountsByDisplayName"
+
+	return Start-ThreadJob -Name $jobName -ScriptBlock {
+		param($modulePath,$proj)
+		Import-Module $modulePath -Force
+		Invoke-MatchAccountsByDisplayName -ProjectPath $proj
+	} -ArgumentList @($modulePath,$proj)
+}
+
+function Get-DiscoveryTable {
+	[CmdletBinding()]
+	param(
+		[Parameter(Mandatory)][ValidateSet('AccountsSource','AccountsTarget','MailboxesSource','MailboxesTarget','Tasks','Metadata')][string]$Table,
+		[string]$ProjectPath,
+		[string]$OutputPath,
+		[switch]$Export
+	)
+
+	$context = Get-MigrationProjectContext -ProjectPath (Resolve-ProjectPath $ProjectPath)
+	$dbPath = Get-MigrationDatabase -ProjectPath $context.ProjectPath
+	$rows = Invoke-MySQLiteQuery -Path $dbPath -Query ("SELECT * FROM {0};" -f $Table)
+
+	$outPathResolved = $null
+	if ($Export -or $OutputPath) {
+		if (-not $OutputPath) {
+			$exportDir = Join-Path $context.ProjectPath 'Exports'
+			if (-not (Test-Path -LiteralPath $exportDir)) {
+				New-Item -ItemType Directory -Path $exportDir -Force | Out-Null
+			}
+			$OutputPath = Join-Path $exportDir ("{0}.csv" -f $Table)
+		}
+		$outDir = Split-Path -Parent $OutputPath
+		if (-not (Test-Path -LiteralPath $outDir)) {
+			New-Item -ItemType Directory -Path $outDir -Force | Out-Null
+		}
+		$rows | Export-Csv -Path $OutputPath -NoTypeInformation -Encoding UTF8
+		$outPathResolved = (Resolve-Path -LiteralPath $OutputPath).Path
+	}
+
+	[pscustomobject]@{
+		Table        = $Table
+		Count        = @($rows).Count
+		Rows         = $rows
+		DatabasePath = $dbPath
+		OutputPath   = $outPathResolved
+	}
+}
+
+function Get-DiscoveryAccountsSource {
+	[CmdletBinding()]
+	param(
+		[string]$ProjectPath,
+		[string]$OutputPath,
+		[switch]$Export
+	)
+
+	$invoke = @{
+		Table       = 'AccountsSource'
+		ProjectPath = $ProjectPath
+	}
+	if ($Export) { $invoke['Export'] = $true }
+	if ($PSBoundParameters.ContainsKey('OutputPath')) { $invoke['OutputPath'] = $OutputPath }
+	Get-DiscoveryTable @invoke
+}
+
+function Get-DiscoveryAccountsTarget {
+	[CmdletBinding()]
+	param(
+		[string]$ProjectPath,
+		[string]$OutputPath,
+		[switch]$Export
+	)
+
+	$invoke = @{
+		Table       = 'AccountsTarget'
+		ProjectPath = $ProjectPath
+	}
+	if ($Export) { $invoke['Export'] = $true }
+	if ($PSBoundParameters.ContainsKey('OutputPath')) { $invoke['OutputPath'] = $OutputPath }
+	Get-DiscoveryTable @invoke
+}
+
+function Get-DiscoveryMailboxesSource {
+	[CmdletBinding()]
+	param(
+		[string]$ProjectPath,
+		[string]$OutputPath,
+		[switch]$Export
+	)
+
+	$invoke = @{
+		Table       = 'MailboxesSource'
+		ProjectPath = $ProjectPath
+	}
+	if ($Export) { $invoke['Export'] = $true }
+	if ($PSBoundParameters.ContainsKey('OutputPath')) { $invoke['OutputPath'] = $OutputPath }
+	Get-DiscoveryTable @invoke
+}
+
+function Get-DiscoveryMailboxesTarget {
+	[CmdletBinding()]
+	param(
+		[string]$ProjectPath,
+		[string]$OutputPath,
+		[switch]$Export
+	)
+
+	$invoke = @{
+		Table       = 'MailboxesTarget'
+		ProjectPath = $ProjectPath
+	}
+	if ($Export) { $invoke['Export'] = $true }
+	if ($PSBoundParameters.ContainsKey('OutputPath')) { $invoke['OutputPath'] = $OutputPath }
+	Get-DiscoveryTable @invoke
+}
+
+function Get-DiscoveryTasks {
+	[CmdletBinding()]
+	param(
+		[string]$ProjectPath,
+		[string]$OutputPath,
+		[switch]$Export
+	)
+
+	$invoke = @{
+		Table       = 'Tasks'
+		ProjectPath = $ProjectPath
+	}
+	if ($Export) { $invoke['Export'] = $true }
+	if ($PSBoundParameters.ContainsKey('OutputPath')) { $invoke['OutputPath'] = $OutputPath }
+	Get-DiscoveryTable @invoke
 }
 
 function Get-MigrationTask {
@@ -1554,94 +1996,335 @@ function Get-MigrationTask {
 function Invoke-DiscoverSourceMailboxStatistics {
 	[CmdletBinding()]
 	param(
-		[string]$ProjectPath,
-		[switch]$UseSqlite
+		[string]$ProjectPath
 	)
 
 	$projectPath = Resolve-ProjectPath $ProjectPath
 	$context = Get-MigrationProjectContext -ProjectPath $projectPath
-	$dbPath = $null
+	$dbPath = Get-MigrationDatabase -ProjectPath $context.ProjectPath
 	$taskId = [guid]::NewGuid().ToString()
 	$statusUpdated = $false
-	if ($UseSqlite) {
-		$dbPath = Get-MigrationDatabase -ProjectPath $context.ProjectPath
-		$nowIso = (Get-Date).ToUniversalTime().ToString('o')
-		Invoke-MySQLiteQuery -Path $dbPath -Query (@"
+	$nowIso = (Get-Date).ToUniversalTime().ToString('o')
+	Invoke-MySQLiteQuery -Path $dbPath -Query (@"
 INSERT OR REPLACE INTO Tasks (taskId, name, total, processed, status, message, startedOnUtc, updatedOnUtc)
 VALUES ('{0}', 'DiscoverSourceMailboxStatistics', 0, 0, 'Running', '', '{1}', '{1}');
 "@ -f $taskId, $nowIso) | Out-Null
-	}
-	elseif (-not $UseSqlite) {
-		throw "Invoke-DiscoverSourceMailboxStatistics requires -UseSqlite to store results in Discovery.sqlite."
-	}
 
-	Connect-ProjectSourceTenant -ProjectPath $context.ProjectPath -Silent | Out-Null
-	Connect-ProjectSourceExchange -ProjectPath $context.ProjectPath | Out-Null
 	try {
-		$mailboxes = Get-EXOMailbox -ResultSize Unlimited -ErrorAction Stop
-		$total = @($mailboxes).Count
-		if ($UseSqlite -and $dbPath) {
-			$nowIso = (Get-Date).ToUniversalTime().ToString('o')
-			Invoke-MySQLiteQuery -Path $dbPath -Query (@"
+		Connect-ProjectSourceTenant -ProjectPath $context.ProjectPath -Silent | Out-Null
+		Connect-ProjectSourceExchange -ProjectPath $context.ProjectPath | Out-Null
+		try {
+			$mailboxes = Get-EXOMailbox -ResultSize Unlimited -ErrorAction Stop
+			$total = @($mailboxes).Count
+				$nowIso = (Get-Date).ToUniversalTime().ToString('o')
+				Invoke-MySQLiteQuery -Path $dbPath -Query (@"
 UPDATE Tasks SET total = {0}, updatedOnUtc = '{1}' WHERE taskId = '{2}';
 "@ -f $total, $nowIso, $taskId) | Out-Null
-		}
-		foreach ($mb in $mailboxes) {
-			$stats = $null
-			try {
-				$stats = Get-EXOMailboxStatistics -Identity $mb.ExternalDirectoryObjectId -ErrorAction Stop
-			}
-			catch {
-				Write-Warning "Failed to get mailbox statistics for $($mb.UserPrincipalName): $($_.Exception.Message)"
-			}
+			foreach ($mb in $mailboxes) {
+				$stats = $null
+				try {
+					$stats = Get-EXOMailboxStatistics -Identity $mb.ExternalDirectoryObjectId -ErrorAction Stop
+				}
+				catch {
+					Write-Warning "Failed to get mailbox statistics for $($mb.UserPrincipalName): $($_.Exception.Message)"
+				}
 
-			$size = $null
-			$itemCount = $null
-			$archiveSize = $null
-			$lastLogon = $null
-			if ($stats) {
-				$size = $stats.TotalItemSize
-				$itemCount = $stats.ItemCount
-				$archiveSize = $stats.TotalDeletedItemSize
-				$lastLogon = $stats.LastLogonTime
-			}
+				$size = $null
+				$itemCount = $null
+				$archiveSize = $null
+				$lastLogon = $null
+				if ($stats) {
+					$size = $stats.TotalItemSize
+					$itemCount = $stats.ItemCount
+					$archiveSize = $stats.TotalDeletedItemSize
+					$lastLogon = $stats.LastLogonTime
+				}
 
-			$recipientType = $mb.RecipientTypeDetails
-			$forwarding = $mb.ForwardingSmtpAddress ?? $mb.ForwardingAddress
-			$holdFlags = @()
-			if ($mb.LitigationHoldEnabled) { $holdFlags += 'LitigationHold' }
-			if ($mb.InPlaceHolds -and $mb.InPlaceHolds.Count -gt 0) { $holdFlags += 'InPlaceHold' }
+				$recipientType = $mb.RecipientTypeDetails
+				$forwarding = $mb.ForwardingSmtpAddress ?? $mb.ForwardingAddress
+				$holdFlags = @()
+				if ($mb.LitigationHoldEnabled) { $holdFlags += 'LitigationHold' }
+				if ($mb.InPlaceHolds -and $mb.InPlaceHolds.Count -gt 0) { $holdFlags += 'InPlaceHold' }
 
-			$nowLoop = (Get-Date).ToUniversalTime().ToString('o')
-			$insertMailbox = @"
+				$nowLoop = (Get-Date).ToUniversalTime().ToString('o')
+				$insertMailbox = @"
 INSERT OR REPLACE INTO MailboxesSource (objectId, recipientType, mailboxType, mailboxSize, itemCount, archiveSize, lastLogon, forwarding, holdFlags, lastSeenUtc)
 VALUES ('{0}', '{1}', '{2}', '{3}', {4}, '{5}', '{6}', '{7}', '{8}', '{9}');
 "@ -f ($mb.ExternalDirectoryObjectId -replace "'","''"), ($recipientType -replace "'","''"), ($recipientType -replace "'","''"), (($size) -replace "'","''"), ($itemCount ?? 'NULL'), (($archiveSize) -replace "'","''"), (($lastLogon) -replace "'","''"), (($forwarding) -replace "'","''"), (($holdFlags -join '|') -replace "'","''"), $nowLoop
-			Invoke-MySQLiteQuery -Path $dbPath -Query $insertMailbox | Out-Null
-			if ($UseSqlite -and $dbPath) {
+				Invoke-MySQLiteQuery -Path $dbPath -Query $insertMailbox | Out-Null
 				Invoke-MySQLiteQuery -Path $dbPath -Query ("UPDATE Tasks SET processed = processed + 1, updatedOnUtc = '{0}' WHERE taskId = '{1}';" -f (Get-Date).ToUniversalTime().ToString('o'), $taskId) | Out-Null
 			}
 		}
-	}
-	finally {
-		Disconnect-ExchangeOnline -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
-	}
-	if ($UseSqlite -and $dbPath) {
+		finally {
+			Disconnect-ExchangeOnline -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
+		}
 		$nowIso = (Get-Date).ToUniversalTime().ToString('o')
 		Invoke-MySQLiteQuery -Path $dbPath -Query ("UPDATE Tasks SET status = 'Completed', updatedOnUtc = '{0}', message = 'OK' WHERE taskId = '{1}';" -f $nowIso, $taskId) | Out-Null
 		$statusUpdated = $true
 		return [pscustomobject]@{ TaskId = $taskId; DatabasePath = $dbPath; Status = 'Completed' }
 	}
-	return $dbPath
+	catch {
+		if ($dbPath -and -not $statusUpdated) {
+			$errIso = (Get-Date).ToUniversalTime().ToString('o')
+			$errMsg = $_.Exception.Message -replace "'","''"
+			Invoke-MySQLiteQuery -Path $dbPath -Query ("UPDATE Tasks SET status = 'Failed', message = '{0}', updatedOnUtc = '{1}' WHERE taskId = '{2}';" -f $errMsg, $errIso, $taskId) | Out-Null
+			$statusUpdated = $true
+		}
+		throw
+	}
+	finally {
+		Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null
+	}
 }
 
-function Start-AccountDiscoveryJob {
+function Invoke-MigrateUsers {
+	[CmdletBinding()]
+	param(
+		[Parameter(Mandatory)][psobject[]]$Users,
+		[string]$ProjectPath,
+		[string[]]$Licenses,
+		[System.Security.SecureString]$Password,
+		[switch]$BlockSignin,
+		[hashtable]$SetProperties
+	)
+
+	if (-not $Users -or $Users.Count -eq 0) {
+		throw "Users collection is required."
+	}
+
+	$projectPath = Resolve-ProjectPath $ProjectPath
+	$context = Get-MigrationProjectContext -ProjectPath $projectPath
+	$dbPath = Get-MigrationDatabase -ProjectPath $context.ProjectPath
+
+	$taskId = [guid]::NewGuid().ToString()
+	$startedIso = (Get-Date).ToUniversalTime().ToString('o')
+	Invoke-MySQLiteQuery -Path $dbPath -Query (@"
+INSERT OR REPLACE INTO Tasks (taskId, name, total, processed, status, message, startedOnUtc, updatedOnUtc)
+VALUES ('{0}', 'MigrateUsersBatch', {1}, 0, 'Running', '', '{2}', '{2}');
+"@ -f $taskId, $Users.Count, $startedIso) | Out-Null
+
+	$defaultDomain = $context.Config.targetTenant.defaultDomain ?? $context.Config.targetTenant.DefaultDomain
+	if (-not $defaultDomain) {
+		throw "Target tenant defaultDomain is missing from Config.json; cannot derive target UPNs."
+	}
+
+	$globalSetProps = @{}
+	if ($SetProperties) {
+		foreach ($key in $SetProperties.Keys) {
+			if ([string]::IsNullOrWhiteSpace([string]$key)) { continue }
+			$globalSetProps[$key] = $SetProperties[$key]
+		}
+	}
+
+	$successCount = 0
+	$sqlUpdates = New-Object System.Collections.Generic.List[string]
+	$errors = @()
+
+	foreach ($u in $Users) {
+		try {
+			$src = $u.Source ?? $u.source ?? $u.SourceUPN ?? $u.sourceUpn
+			if (-not $src -or [string]::IsNullOrWhiteSpace($src)) {
+				throw "User entry is missing Source."
+			}
+			$src = $src.Trim()
+
+			$target = $u.Target ?? $u.target
+			if ($target -and [string]::IsNullOrWhiteSpace($target)) { $target = $null }
+			if ($target) { $target = $target.Trim() }
+
+			$userLicenses = $u.Licenses ?? $u.licenses ?? $Licenses
+			$userPassword = $u.Password
+			if (-not $userPassword) { $userPassword = $Password }
+			if (-not $userPassword) {
+				throw "No password provided for $src. Supply -Password or per-user Password."
+			}
+			$userSetProps = $null
+			if ($u -is [psobject]) {
+				if ($u.PSObject.Properties['SetProperties']) { $userSetProps = $u.SetProperties }
+				elseif ($u.PSObject.Properties['setProperties']) { $userSetProps = $u.setProperties }
+			}
+
+			# Determine target UPN: prefer provided, then matched in DB, else default domain
+			if (-not $target) {
+				$query = "SELECT targetUpn FROM AccountsSource WHERE sourceUpn = '{0}' LIMIT 1;" -f ($src -replace "'","''")
+				$row = Invoke-MySQLiteQuery -Path $dbPath -Query $query | Select-Object -First 1
+				if ($row -and $row.targetUpn -and (-not [string]::IsNullOrWhiteSpace($row.targetUpn))) {
+					$target = $row.targetUpn.Trim()
+				}
+			}
+			if (-not $target) {
+				$local = ($src -split '@')[0]
+				$target = "$local@$defaultDomain"
+			}
+			if ([string]::IsNullOrWhiteSpace($target)) {
+				throw "Target UPN resolved to empty for $src."
+			}
+
+			$plainPasswordPtr = [IntPtr]::Zero
+			$plainPassword = $null
+			try {
+				if ($userPassword -is [System.Security.SecureString]) {
+					$plainPasswordPtr = [Runtime.InteropServices.Marshal]::SecureStringToGlobalAllocUnicode($userPassword)
+					$plainPassword = [Runtime.InteropServices.Marshal]::PtrToStringUni($plainPasswordPtr)
+				}
+				else {
+					$plainPassword = [string]$userPassword
+				}
+				if ([string]::IsNullOrWhiteSpace($plainPassword)) {
+					throw "Password for $src is empty."
+				}
+			}
+			finally {
+				if ($plainPasswordPtr -ne [IntPtr]::Zero) {
+					[Runtime.InteropServices.Marshal]::ZeroFreeGlobalAllocUnicode($plainPasswordPtr)
+				}
+			}
+
+			$sourceProps = @(
+				'displayName','givenName','surname','mailNickname','jobTitle','department',
+				'officeLocation','businessPhones','mobilePhone','usageLocation','userPrincipalName','onPremisesSyncEnabled'
+			)
+
+			Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null
+			Connect-ProjectSourceTenant -ProjectPath $context.ProjectPath -Silent | Out-Null
+			try {
+				$srcUser = Get-MgUser -UserId $src -Property $sourceProps -ErrorAction Stop
+			}
+			finally {
+				Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null
+			}
+
+			Connect-ProjectTargetTenant -ProjectPath $context.ProjectPath -Silent | Out-Null
+			try {
+				try {
+					$existing = Get-MgUser -UserId $target -ErrorAction Stop
+					if ($existing) { throw "User '$target' already exists in target tenant." }
+				}
+				catch {
+					$message = $_.Exception.Message
+					if ($message -notmatch 'Request_ResourceNotFound' -and $message -notmatch 'ResourceNotFound' -and $message -notmatch '404') {
+						throw
+					}
+				}
+
+				$body = [ordered]@{
+					userPrincipalName = $target
+					accountEnabled    = (-not $BlockSignin)
+					passwordProfile   = @{
+						password = $plainPassword
+						forceChangePasswordNextSignIn = $true
+					}
+				}
+				if ($srcUser.DisplayName) { $body['displayName'] = $srcUser.DisplayName }
+				if ($srcUser.MailNickname) { $body['mailNickname'] = $srcUser.MailNickname } else {
+					$local = ($target -split '@')[0]
+					$body['mailNickname'] = $local
+				}
+				if ($srcUser.GivenName) { $body['givenName'] = $srcUser.GivenName }
+				if ($srcUser.Surname) { $body['surname'] = $srcUser.Surname }
+				if ($srcUser.JobTitle) { $body['jobTitle'] = $srcUser.JobTitle }
+				if ($srcUser.Department) { $body['department'] = $srcUser.Department }
+				if ($srcUser.OfficeLocation) { $body['officeLocation'] = $srcUser.OfficeLocation }
+				if ($srcUser.MobilePhone) { $body['mobilePhone'] = $srcUser.MobilePhone }
+				if ($srcUser.BusinessPhones) { $body['businessPhones'] = @($srcUser.BusinessPhones | Where-Object { $_ }) }
+				if ($srcUser.UsageLocation) { $body['usageLocation'] = $srcUser.UsageLocation }
+				elseif ($userLicenses -and $userLicenses.Count -gt 0) { $body['usageLocation'] = 'US' }
+				if ($globalSetProps.Keys.Count -gt 0) {
+					foreach ($key in $globalSetProps.Keys) {
+						if ([string]::IsNullOrWhiteSpace([string]$key)) { continue }
+						$body[$key] = $globalSetProps[$key]
+					}
+				}
+				if ($userSetProps -is [System.Collections.IDictionary]) {
+					foreach ($key in $userSetProps.Keys) {
+						if ([string]::IsNullOrWhiteSpace([string]$key)) { continue }
+						$body[$key] = $userSetProps[$key]
+					}
+				}
+
+				$newUser = New-MgUser -BodyParameter $body -ErrorAction Stop
+
+				if ($userLicenses -and $userLicenses.Count -gt 0) {
+					$licenseAdd = @()
+					foreach ($sku in $userLicenses) {
+						$licenseAdd += @{ skuId = $sku }
+					}
+					Set-MgUserLicense -UserId $newUser.Id -AddLicenses $licenseAdd -ErrorAction Stop | Out-Null
+				}
+
+				$successCount++
+				$nowIsoUser = (Get-Date).ToUniversalTime().ToString('o')
+				$escapedTarget = $target -replace "'","''"
+				$escapedSource = $src -replace "'","''"
+				$sqlUpdates.Add(@"
+UPDATE AccountsSource SET targetUpn = '$escapedTarget', status = 'Matched', lastSeenUtc = '$nowIsoUser' WHERE sourceUpn = '$escapedSource' OR objectId = '$($srcUser.Id -replace "'","''")';
+INSERT INTO AccountsTarget (objectId, targetUpn, displayName, mail, proxyAddresses, assignedLicenses, mailboxType, usageLocation, lastSeenUtc, status)
+VALUES ('$($newUser.Id -replace "'","''")', '$escapedTarget', '$(($body.displayName ?? $srcUser.DisplayName) -replace "'","''")', '$(($body.mail ?? $newUser.Mail) -replace "'","''")', '', '', '', '$(($body.usageLocation ?? 'US') -replace "'","''")', '$nowIsoUser', 'Matched')
+ON CONFLICT(objectId) DO UPDATE SET
+	targetUpn = excluded.targetUpn,
+	displayName = excluded.displayName,
+	mail = excluded.mail,
+	usageLocation = excluded.usageLocation,
+	lastSeenUtc = excluded.lastSeenUtc,
+	status = 'Matched';
+UPDATE Tasks SET processed = processed + 1, updatedOnUtc = '$nowIsoUser' WHERE taskId = '$taskId';
+"@)
+			}
+			finally {
+				Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null
+			}
+		}
+		catch {
+			$errors += $_.Exception.Message
+		}
+	}
+
+	$finalIso = (Get-Date).ToUniversalTime().ToString('o')
+	$status = if ($errors.Count -gt 0) { 'Failed' } else { 'Completed' }
+	$message = if ($errors.Count -gt 0) { ($errors -join '; ') } else { 'OK' }
+
+	$sqlScript = "BEGIN;" + [Environment]::NewLine + ($sqlUpdates -join [Environment]::NewLine) + [Environment]::NewLine + ("UPDATE Tasks SET processed = {0}, status = '{1}', message = '{2}', updatedOnUtc = '{3}' WHERE taskId = '{4}';" -f $successCount, $status, ($message -replace "'","''"), $finalIso, $taskId) + [Environment]::NewLine + "COMMIT;"
+	Invoke-MySQLiteQuery -Path $dbPath -Query $sqlScript | Out-Null
+
+	[pscustomobject]@{
+		TaskId       = $taskId
+		DatabasePath = $dbPath
+		Requested    = $Users.Count
+		Succeeded    = $successCount
+		Failed       = $errors.Count
+		Errors       = $errors
+	}
+}
+
+function Start-ProjectMigrateUsersTask {
+	[CmdletBinding()]
+	param(
+		[Parameter(Mandatory)][psobject[]]$Users,
+		[string]$ProjectPath,
+		[string[]]$Licenses,
+		[System.Security.SecureString]$Password,
+		[switch]$BlockSignin,
+		[hashtable]$SetProperties
+	)
+
+	Assert-ThreadJobAvailable
+	$modulePath = $MyInvocation.MyCommand.Module.Path
+	$proj = Resolve-ProjectPath $ProjectPath
+	$jobName = "Migrate-UsersBatch"
+
+	return Start-ThreadJob -Name $jobName -ScriptBlock {
+		param($modulePath,$proj,$users,$licenses,$password,$blockSignin,$setProps)
+		Import-Module $modulePath -Force
+		Invoke-MigrateUsers -Users $users -ProjectPath $proj -Licenses $licenses -Password $password -BlockSignin:$blockSignin -SetProperties $setProps
+	} -ArgumentList @($modulePath,$proj,$Users,$Licenses,$Password,$BlockSignin,$SetProperties)
+}
+
+function Start-ProjectDiscoveryTask {
 	[CmdletBinding()]
 	param(
 		[ValidateSet('Source','Target')][string]$Scope = 'Source',
 		[string]$ProjectPath,
-		[string]$OutputPath,
-		[switch]$UseSqlite
+		[string]$OutputPath
 	)
 
 	Assert-ThreadJobAvailable
@@ -1650,22 +2333,21 @@ function Start-AccountDiscoveryJob {
 	$jobName = "Discover-$Scope"
 
 	return Start-ThreadJob -Name $jobName -ScriptBlock {
-		param($modulePath,$proj,$output,$useSqlite,$scope)
+		param($modulePath,$proj,$output,$scope)
 		Import-Module $modulePath -Force
 		if ($scope -eq 'Target') {
-			Invoke-DiscoverTargetAccounts -ProjectPath $proj -OutputPath $output -UseSqlite:$useSqlite
+			Invoke-DiscoverTargetAccounts -ProjectPath $proj -OutputPath $output
 		}
 		else {
-			Invoke-DiscoverSourceAccounts -ProjectPath $proj -OutputPath $output -UseSqlite:$useSqlite
+			Invoke-DiscoverSourceAccounts -ProjectPath $proj -OutputPath $output
 		}
-	} -ArgumentList @($modulePath,$proj,$OutputPath,$UseSqlite,$Scope)
+	} -ArgumentList @($modulePath,$proj,$OutputPath,$Scope)
 }
 
-function Start-CollectMailboxStatisticsJob {
+function Start-ProjectMailboxStatsTask {
 	[CmdletBinding()]
 	param(
-		[string]$ProjectPath,
-		[switch]$UseSqlite
+		[string]$ProjectPath
 	)
 
 	Assert-ThreadJobAvailable
@@ -1674,10 +2356,10 @@ function Start-CollectMailboxStatisticsJob {
 	$jobName = "Discover-SourceMailboxStats"
 
 	return Start-ThreadJob -Name $jobName -ScriptBlock {
-		param($modulePath,$proj,$useSqlite)
+		param($modulePath,$proj)
 		Import-Module $modulePath -Force
-		Invoke-DiscoverSourceMailboxStatistics -ProjectPath $proj -UseSqlite:$useSqlite
-	} -ArgumentList @($modulePath,$proj,$UseSqlite)
+		Invoke-DiscoverSourceMailboxStatistics -ProjectPath $proj
+	} -ArgumentList @($modulePath,$proj)
 }
 
 function Invoke-ProjectTenantProvisioning {
@@ -1793,11 +2475,11 @@ function Add-ProjectSourceTenant {
 }
 
 function Connect-ProjectSourceTenant {
-	[CmdletBinding()]
-	param(
-		[string]$ProjectPath,
-		[switch]$PassThruProfile,
-		[switch]$Silent
+		[CmdletBinding()]
+		param(
+			[string]$ProjectPath,
+			[switch]$PassThruProfile,
+			[switch]$Silent
 	)
 
 	$ProjectPath = Resolve-ProjectPath $ProjectPath
@@ -1810,8 +2492,8 @@ function Connect-ProjectSourceTenant {
 	if ($Silent) {
 		$connectParams['Verbose'] = $false
 	}
-	else {
-		$connectParams['Verbose'] = $VerbosePreference
+	elseif ($PSBoundParameters.ContainsKey('Verbose')) {
+		$connectParams['Verbose'] = $true
 	}
 	Connect-Source @connectParams
 }
@@ -1834,8 +2516,8 @@ function Connect-ProjectTargetTenant {
 	if ($Silent) {
 		$connectParams['Verbose'] = $false
 	}
-	else {
-		$connectParams['Verbose'] = $VerbosePreference
+	elseif ($PSBoundParameters.ContainsKey('Verbose')) {
+		$connectParams['Verbose'] = $true
 	}
 	Connect-Target @connectParams
 }
@@ -1857,14 +2539,29 @@ Export-ModuleMember -Function `
 	Invoke-DiscoverSourceAccounts, `
 	Invoke-DiscoverTargetAccounts, `
 	Invoke-DiscoverSourceMailboxStatistics, `
-	Start-AccountDiscoveryJob, `
-	Start-CollectMailboxStatisticsJob, `
 	New-MgCustomApp, `
+	Get-MicrosoftProductSheet, `
+	Import-MicrosoftProductSheet, `
+	Get-MSProduct, `
+	Get-MicrosoftOfficeProduct, `
 	Set-ActiveMigrationProject, `
 	Clear-ActiveMigrationProject, `
 	Get-ActiveMigrationProject, `
 	Connect-Source, `
 	Connect-Target, `
+	Set-AccountMatchesByDisplayName, `
+	Invoke-MatchAccountsByDisplayName, `
+	Start-ProjectMatchAccountsTask, `
+	Invoke-MigrateUsers, `
+	Start-ProjectMigrateUsersTask, `
+	Start-ProjectDiscoveryTask, `
+	Start-ProjectMailboxStatsTask, `
+	Get-DiscoveryTable, `
+	Get-DiscoveryAccountsSource, `
+	Get-DiscoveryAccountsTarget, `
+	Get-DiscoveryMailboxesSource, `
+	Get-DiscoveryMailboxesTarget, `
+	Get-DiscoveryTasks, `
 	Connect-ProjectSourceExchange, `
 	Connect-ProjectTargetExchange, `
 	New-MigrationProject, `

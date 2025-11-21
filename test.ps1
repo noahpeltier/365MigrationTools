@@ -56,3 +56,8 @@ $TargetScopes = @(
 
 Add-ProjectSourceTenant -TenantId 29aa692a-96ad-47b1-b073-9fd3d96cd3c2 -AppDisplayName SpetrumMigrationApp -Permissions $SourceScopes -EnableExchangeManageAsApp
 Add-ProjectTargetTenant -TenantId a924863a-a67c-44b5-b1af-9735ccf85acb -AppDisplayName SpetrumMigrationApp -Permissions $TargetScopes -EnableExchangeManageAsApp
+
+
+
+$MigrateAccounts = (Get-DiscoveryAccountsSource).rows | ocgv -Title "Discovered Accounts"
+Invoke-MigrateUser -Source $MigrateAccounts.sourceUpn -BlockSignin -Password (New-DicePassphrase -AsSecureString)
