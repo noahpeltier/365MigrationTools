@@ -2105,6 +2105,8 @@ VALUES ('{0}', 'MigrateUsersBatch', {1}, 0, 'Running', '', '{2}', '{2}');
 
 	$defaultDomain = $context.Config.targetTenant.defaultDomain ?? $context.Config.targetTenant.DefaultDomain
 	if (-not $defaultDomain) {
+		$failIso = (Get-Date).ToUniversalTime().ToString('o')
+		Invoke-MySQLiteQuery -Path $dbPath -Query ("UPDATE Tasks SET status = 'Failed', message = 'Target tenant defaultDomain is missing from Config.json; cannot derive target UPNs.', updatedOnUtc = '{0}' WHERE taskId = '{1}';" -f $failIso, $taskId) | Out-Null
 		throw "Target tenant defaultDomain is missing from Config.json; cannot derive target UPNs."
 	}
 
@@ -2120,143 +2122,144 @@ VALUES ('{0}', 'MigrateUsersBatch', {1}, 0, 'Running', '', '{2}', '{2}');
 	$sqlUpdates = New-Object System.Collections.Generic.List[string]
 	$errors = @()
 
-	foreach ($u in $Users) {
-		try {
-			$src = $u.Source ?? $u.source ?? $u.SourceUPN ?? $u.sourceUpn
-			if (-not $src -or [string]::IsNullOrWhiteSpace($src)) {
-				throw "User entry is missing Source."
-			}
-			$src = $src.Trim()
-
-			$target = $u.Target ?? $u.target
-			if ($target -and [string]::IsNullOrWhiteSpace($target)) { $target = $null }
-			if ($target) { $target = $target.Trim() }
-
-			$userLicenses = $u.Licenses ?? $u.licenses ?? $Licenses
-			$userPassword = $u.Password
-			if (-not $userPassword) { $userPassword = $Password }
-			if (-not $userPassword) {
-				throw "No password provided for $src. Supply -Password or per-user Password."
-			}
-			$userSetProps = $null
-			if ($u -is [psobject]) {
-				if ($u.PSObject.Properties['SetProperties']) { $userSetProps = $u.SetProperties }
-				elseif ($u.PSObject.Properties['setProperties']) { $userSetProps = $u.setProperties }
-			}
-
-			# Determine target UPN: prefer provided, then matched in DB, else default domain
-			if (-not $target) {
-				$query = "SELECT targetUpn FROM AccountsSource WHERE sourceUpn = '{0}' LIMIT 1;" -f ($src -replace "'","''")
-				$row = Invoke-MySQLiteQuery -Path $dbPath -Query $query | Select-Object -First 1
-				if ($row -and $row.targetUpn -and (-not [string]::IsNullOrWhiteSpace($row.targetUpn))) {
-					$target = $row.targetUpn.Trim()
-				}
-			}
-			if (-not $target) {
-				$local = ($src -split '@')[0]
-				$target = "$local@$defaultDomain"
-			}
-			if ([string]::IsNullOrWhiteSpace($target)) {
-				throw "Target UPN resolved to empty for $src."
-			}
-
-			$plainPasswordPtr = [IntPtr]::Zero
-			$plainPassword = $null
+	try {
+		foreach ($u in $Users) {
 			try {
-				if ($userPassword -is [System.Security.SecureString]) {
-					$plainPasswordPtr = [Runtime.InteropServices.Marshal]::SecureStringToGlobalAllocUnicode($userPassword)
-					$plainPassword = [Runtime.InteropServices.Marshal]::PtrToStringUni($plainPasswordPtr)
+				$src = $u.Source ?? $u.source ?? $u.SourceUPN ?? $u.sourceUpn
+				if (-not $src -or [string]::IsNullOrWhiteSpace($src)) {
+					throw "User entry is missing Source."
 				}
-				else {
-					$plainPassword = [string]$userPassword
-				}
-				if ([string]::IsNullOrWhiteSpace($plainPassword)) {
-					throw "Password for $src is empty."
-				}
-			}
-			finally {
-				if ($plainPasswordPtr -ne [IntPtr]::Zero) {
-					[Runtime.InteropServices.Marshal]::ZeroFreeGlobalAllocUnicode($plainPasswordPtr)
-				}
-			}
+				$src = $src.Trim()
 
-			$sourceProps = @(
-				'displayName','givenName','surname','mailNickname','jobTitle','department',
-				'officeLocation','businessPhones','mobilePhone','usageLocation','userPrincipalName','onPremisesSyncEnabled'
-			)
+				$target = $u.Target ?? $u.target
+				if ($target -and [string]::IsNullOrWhiteSpace($target)) { $target = $null }
+				if ($target) { $target = $target.Trim() }
 
-			Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null
-			Connect-ProjectSourceTenant -ProjectPath $context.ProjectPath -Silent | Out-Null
-			try {
-				$srcUser = Get-MgUser -UserId $src -Property $sourceProps -ErrorAction Stop
-			}
-			finally {
-				Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null
-			}
+				$userLicenses = $u.Licenses ?? $u.licenses ?? $Licenses
+				$userPassword = $u.Password
+				if (-not $userPassword) { $userPassword = $Password }
+				if (-not $userPassword) {
+					throw "No password provided for $src. Supply -Password or per-user Password."
+				}
+				$userSetProps = $null
+				if ($u -is [psobject]) {
+					if ($u.PSObject.Properties['SetProperties']) { $userSetProps = $u.SetProperties }
+					elseif ($u.PSObject.Properties['setProperties']) { $userSetProps = $u.setProperties }
+				}
 
-			Connect-ProjectTargetTenant -ProjectPath $context.ProjectPath -Silent | Out-Null
-			try {
+				# Determine target UPN: prefer provided, then matched in DB, else default domain
+				if (-not $target) {
+					$query = "SELECT targetUpn FROM AccountsSource WHERE sourceUpn = '{0}' LIMIT 1;" -f ($src -replace "'","''")
+					$row = Invoke-MySQLiteQuery -Path $dbPath -Query $query | Select-Object -First 1
+					if ($row -and $row.targetUpn -and (-not [string]::IsNullOrWhiteSpace($row.targetUpn))) {
+						$target = $row.targetUpn.Trim()
+					}
+				}
+				if (-not $target) {
+					$local = ($src -split '@')[0]
+					$target = "$local@$defaultDomain"
+				}
+				if ([string]::IsNullOrWhiteSpace($target)) {
+					throw "Target UPN resolved to empty for $src."
+				}
+
+				$plainPasswordPtr = [IntPtr]::Zero
+				$plainPassword = $null
 				try {
-					$existing = Get-MgUser -UserId $target -ErrorAction Stop
-					if ($existing) { throw "User '$target' already exists in target tenant." }
+					if ($userPassword -is [System.Security.SecureString]) {
+						$plainPasswordPtr = [Runtime.InteropServices.Marshal]::SecureStringToGlobalAllocUnicode($userPassword)
+						$plainPassword = [Runtime.InteropServices.Marshal]::PtrToStringUni($plainPasswordPtr)
+					}
+					else {
+						$plainPassword = [string]$userPassword
+					}
+					if ([string]::IsNullOrWhiteSpace($plainPassword)) {
+						throw "Password for $src is empty."
+					}
 				}
-				catch {
-					$message = $_.Exception.Message
-					if ($message -notmatch 'Request_ResourceNotFound' -and $message -notmatch 'ResourceNotFound' -and $message -notmatch '404') {
-						throw
+				finally {
+					if ($plainPasswordPtr -ne [IntPtr]::Zero) {
+						[Runtime.InteropServices.Marshal]::ZeroFreeGlobalAllocUnicode($plainPasswordPtr)
 					}
 				}
 
-				$body = [ordered]@{
-					userPrincipalName = $target
-					accountEnabled    = (-not $BlockSignin)
-					passwordProfile   = @{
-						password = $plainPassword
-						forceChangePasswordNextSignIn = $true
-					}
+				$sourceProps = @(
+					'displayName','givenName','surname','mailNickname','jobTitle','department',
+					'officeLocation','businessPhones','mobilePhone','usageLocation','userPrincipalName','onPremisesSyncEnabled'
+				)
+
+				Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null
+				Connect-ProjectSourceTenant -ProjectPath $context.ProjectPath -Silent | Out-Null
+				try {
+					$srcUser = Get-MgUser -UserId $src -Property $sourceProps -ErrorAction Stop
 				}
-				if ($srcUser.DisplayName) { $body['displayName'] = $srcUser.DisplayName }
-				if ($srcUser.MailNickname) { $body['mailNickname'] = $srcUser.MailNickname } else {
-					$local = ($target -split '@')[0]
-					$body['mailNickname'] = $local
-				}
-				if ($srcUser.GivenName) { $body['givenName'] = $srcUser.GivenName }
-				if ($srcUser.Surname) { $body['surname'] = $srcUser.Surname }
-				if ($srcUser.JobTitle) { $body['jobTitle'] = $srcUser.JobTitle }
-				if ($srcUser.Department) { $body['department'] = $srcUser.Department }
-				if ($srcUser.OfficeLocation) { $body['officeLocation'] = $srcUser.OfficeLocation }
-				if ($srcUser.MobilePhone) { $body['mobilePhone'] = $srcUser.MobilePhone }
-				if ($srcUser.BusinessPhones) { $body['businessPhones'] = @($srcUser.BusinessPhones | Where-Object { $_ }) }
-				if ($srcUser.UsageLocation) { $body['usageLocation'] = $srcUser.UsageLocation }
-				elseif ($userLicenses -and $userLicenses.Count -gt 0) { $body['usageLocation'] = 'US' }
-				if ($globalSetProps.Keys.Count -gt 0) {
-					foreach ($key in $globalSetProps.Keys) {
-						if ([string]::IsNullOrWhiteSpace([string]$key)) { continue }
-						$body[$key] = $globalSetProps[$key]
-					}
-				}
-				if ($userSetProps -is [System.Collections.IDictionary]) {
-					foreach ($key in $userSetProps.Keys) {
-						if ([string]::IsNullOrWhiteSpace([string]$key)) { continue }
-						$body[$key] = $userSetProps[$key]
-					}
+				finally {
+					Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null
 				}
 
-				$newUser = New-MgUser -BodyParameter $body -ErrorAction Stop
-
-				if ($userLicenses -and $userLicenses.Count -gt 0) {
-					$licenseAdd = @()
-					foreach ($sku in $userLicenses) {
-						$licenseAdd += @{ skuId = $sku }
+				Connect-ProjectTargetTenant -ProjectPath $context.ProjectPath -Silent | Out-Null
+				try {
+					try {
+						$existing = Get-MgUser -UserId $target -ErrorAction Stop
+						if ($existing) { throw "User '$target' already exists in target tenant." }
 					}
-					Set-MgUserLicense -UserId $newUser.Id -AddLicenses $licenseAdd -ErrorAction Stop | Out-Null
-				}
+					catch {
+						$message = $_.Exception.Message
+						if ($message -notmatch 'Request_ResourceNotFound' -and $message -notmatch 'ResourceNotFound' -and $message -notmatch '404') {
+							throw
+						}
+					}
 
-				$successCount++
-				$nowIsoUser = (Get-Date).ToUniversalTime().ToString('o')
-				$escapedTarget = $target -replace "'","''"
-				$escapedSource = $src -replace "'","''"
-				$sqlUpdates.Add(@"
+					$body = [ordered]@{
+						userPrincipalName = $target
+						accountEnabled    = (-not $BlockSignin)
+						passwordProfile   = @{
+							password = $plainPassword
+							forceChangePasswordNextSignIn = $true
+						}
+					}
+					if ($srcUser.DisplayName) { $body['displayName'] = $srcUser.DisplayName }
+					if ($srcUser.MailNickname) { $body['mailNickname'] = $srcUser.MailNickname } else {
+						$local = ($target -split '@')[0]
+						$body['mailNickname'] = $local
+					}
+					if ($srcUser.GivenName) { $body['givenName'] = $srcUser.GivenName }
+					if ($srcUser.Surname) { $body['surname'] = $srcUser.Surname }
+					if ($srcUser.JobTitle) { $body['jobTitle'] = $srcUser.JobTitle }
+					if ($srcUser.Department) { $body['department'] = $srcUser.Department }
+					if ($srcUser.OfficeLocation) { $body['officeLocation'] = $srcUser.OfficeLocation }
+					if ($srcUser.MobilePhone) { $body['mobilePhone'] = $srcUser.MobilePhone }
+					if ($srcUser.BusinessPhones) { $body['businessPhones'] = @($srcUser.BusinessPhones | Where-Object { $_ }) }
+					if ($srcUser.UsageLocation) { $body['usageLocation'] = $srcUser.UsageLocation }
+					elseif ($userLicenses -and $userLicenses.Count -gt 0) { $body['usageLocation'] = 'US' }
+					if ($globalSetProps.Keys.Count -gt 0) {
+						foreach ($key in $globalSetProps.Keys) {
+							if ([string]::IsNullOrWhiteSpace([string]$key)) { continue }
+							$body[$key] = $globalSetProps[$key]
+						}
+					}
+					if ($userSetProps -is [System.Collections.IDictionary]) {
+						foreach ($key in $userSetProps.Keys) {
+							if ([string]::IsNullOrWhiteSpace([string]$key)) { continue }
+							$body[$key] = $userSetProps[$key]
+						}
+					}
+
+					$newUser = New-MgUser -BodyParameter $body -ErrorAction Stop
+
+					if ($userLicenses -and $userLicenses.Count -gt 0) {
+						$licenseAdd = @()
+						foreach ($sku in $userLicenses) {
+							$licenseAdd += @{ skuId = $sku }
+						}
+						Set-MgUserLicense -UserId $newUser.Id -AddLicenses $licenseAdd -ErrorAction Stop | Out-Null
+					}
+
+					$successCount++
+					$nowIsoUser = (Get-Date).ToUniversalTime().ToString('o')
+					$escapedTarget = $target -replace "'","''"
+					$escapedSource = $src -replace "'","''"
+					$sqlUpdates.Add(@"
 UPDATE AccountsSource SET targetUpn = '$escapedTarget', status = 'Matched', lastSeenUtc = '$nowIsoUser' WHERE sourceUpn = '$escapedSource' OR objectId = '$($srcUser.Id -replace "'","''")';
 INSERT INTO AccountsTarget (objectId, targetUpn, displayName, mail, proxyAddresses, assignedLicenses, mailboxType, usageLocation, lastSeenUtc, status)
 VALUES ('$($newUser.Id -replace "'","''")', '$escapedTarget', '$(($body.displayName ?? $srcUser.DisplayName) -replace "'","''")', '$(($body.mail ?? $newUser.Mail) -replace "'","''")', '', '', '', '$(($body.usageLocation ?? 'US') -replace "'","''")', '$nowIsoUser', 'Matched')
@@ -2269,22 +2272,52 @@ ON CONFLICT(objectId) DO UPDATE SET
 	status = 'Matched';
 UPDATE Tasks SET processed = processed + 1, updatedOnUtc = '$nowIsoUser' WHERE taskId = '$taskId';
 "@)
+				}
+				finally {
+					Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null
+				}
 			}
-			finally {
-				Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null
+			catch {
+				$errors += $_.Exception.Message
 			}
 		}
-		catch {
-			$errors += $_.Exception.Message
-		}
-	}
 
 	$finalIso = (Get-Date).ToUniversalTime().ToString('o')
 	$status = if ($errors.Count -gt 0) { 'Failed' } else { 'Completed' }
 	$message = if ($errors.Count -gt 0) { ($errors -join '; ') } else { 'OK' }
+	$taskUpdate = ("UPDATE Tasks SET processed = {0}, status = '{1}', message = '{2}', updatedOnUtc = '{3}' WHERE taskId = '{4}';" -f $successCount, $status, ($message -replace "'","''"), $finalIso, $taskId)
 
-	$sqlScript = "BEGIN;" + [Environment]::NewLine + ($sqlUpdates -join [Environment]::NewLine) + [Environment]::NewLine + ("UPDATE Tasks SET processed = {0}, status = '{1}', message = '{2}', updatedOnUtc = '{3}' WHERE taskId = '{4}';" -f $successCount, $status, ($message -replace "'","''"), $finalIso, $taskId) + [Environment]::NewLine + "COMMIT;"
-	Invoke-MySQLiteQuery -Path $dbPath -Query $sqlScript | Out-Null
+	try {
+		Invoke-MySQLiteQuery -Path $dbPath -Query "BEGIN;" | Out-Null
+		foreach ($stmt in $sqlUpdates) {
+			Invoke-MySQLiteQuery -Path $dbPath -Query $stmt | Out-Null
+		}
+		Invoke-MySQLiteQuery -Path $dbPath -Query $taskUpdate | Out-Null
+		Invoke-MySQLiteQuery -Path $dbPath -Query "COMMIT;" | Out-Null
+	}
+	catch {
+		# Fallback to individual statements to avoid leaving the task in Running state
+		try {
+			Invoke-MySQLiteQuery -Path $dbPath -Query "BEGIN;" | Out-Null
+			foreach ($stmt in $sqlUpdates) {
+				Invoke-MySQLiteQuery -Path $dbPath -Query $stmt | Out-Null
+			}
+			Invoke-MySQLiteQuery -Path $dbPath -Query $taskUpdate | Out-Null
+			Invoke-MySQLiteQuery -Path $dbPath -Query "COMMIT;" | Out-Null
+		}
+		catch {
+			$errMsg = $_.Exception.Message -replace "'","''"
+			Invoke-MySQLiteQuery -Path $dbPath -Query ("UPDATE Tasks SET status = 'Failed', processed = {0}, message = '{1}', updatedOnUtc = '{2}' WHERE taskId = '{3}';" -f $successCount, $errMsg, $finalIso, $taskId) | Out-Null
+			throw
+		}
+	}
+	}
+	catch {
+		$errMsgOuter = $_.Exception.Message -replace "'","''"
+		$failIsoOuter = (Get-Date).ToUniversalTime().ToString('o')
+		Invoke-MySQLiteQuery -Path $dbPath -Query ("UPDATE Tasks SET status = 'Failed', message = '{0}', updatedOnUtc = '{1}' WHERE taskId = '{2}';" -f $errMsgOuter, $failIsoOuter, $taskId) | Out-Null
+		throw
+	}
 
 	[pscustomobject]@{
 		TaskId       = $taskId
@@ -2461,15 +2494,36 @@ function Add-ProjectTargetTenant {
 }
 
 function Add-ProjectSourceTenant {
-	[CmdletBinding()]
+	[CmdletBinding(DefaultParameterSetName = 'Provision')]
 	param(
-		[Parameter(Mandatory)][string]$TenantId,
+		[Parameter(Mandatory, ParameterSetName = 'Provision')][string]$TenantId,
+		[Parameter(ParameterSetName = 'Provision')]
+		[Parameter(ParameterSetName = 'Import')]
 		[string]$ProjectPath,
-		[string]$AppDisplayName,
-		[ValidateSet('Certificate', 'ClientCredential')][string]$AuthType = 'Certificate',
-		[string[]]$Permissions = @('Directory.Read.All','User.Read.All'),
-		[switch]$EnableExchangeManageAsApp
+		[Parameter(ParameterSetName = 'Provision')][string]$AppDisplayName,
+		[Parameter(ParameterSetName = 'Provision')][ValidateSet('Certificate', 'ClientCredential')][string]$AuthType = 'Certificate',
+		[Parameter(ParameterSetName = 'Provision')][string[]]$Permissions = @('Directory.Read.All','User.Read.All'),
+		[Parameter(ParameterSetName = 'Provision')][switch]$EnableExchangeManageAsApp,
+
+		[Parameter(Mandatory, ParameterSetName = 'Import')][string]$ImportProjectPath,
+		[Parameter(ParameterSetName = 'Import')][string]$ImportConfigPath,
+		[Parameter(ParameterSetName = 'Import')][string]$ImportTenantKey = 'sourceTenant',
+		[Parameter(ParameterSetName = 'Import')][string]$ProfileName = 'Source'
 	)
+
+	if ($PSCmdlet.ParameterSetName -eq 'Import') {
+		$destinationProject = Resolve-ProjectPath $ProjectPath
+		$destinationContext = Get-MigrationProjectContext -ProjectPath $destinationProject
+		$sourceConfig = $ImportConfigPath
+		if ($ImportProjectPath -and -not $sourceConfig) {
+			$resolvedImportProject = (Resolve-Path -LiteralPath $ImportProjectPath).Path
+			$sourceConfig = Join-Path $resolvedImportProject 'Config.json'
+		}
+		if (-not $sourceConfig) {
+			throw "Specify -ImportProjectPath (project root) or -ImportConfigPath (Config.json) to import the source tenant."
+		}
+		return Import-ProjectTenantConfig -SourceConfigPath $sourceConfig -DestinationConfigPath $destinationContext.ConfigPath -DestinationProfilesPath $destinationContext.ProfilesPath -SourceTenantKey $ImportTenantKey -DestinationTenantKey 'sourceTenant' -ProfileName $ProfileName
+	}
 
 	Invoke-ProjectTenantProvisioning -TenantId $TenantId -TenantKey 'sourceTenant' -ProfileName 'Source' -ProjectPath (Resolve-ProjectPath $ProjectPath) -AppDisplayName $AppDisplayName -AuthType $AuthType -Permissions $Permissions -EnableExchangeManageAsApp:$EnableExchangeManageAsApp -Description 'Source tenant'
 }
